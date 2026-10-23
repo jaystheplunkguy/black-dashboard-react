@@ -1,0 +1,11 @@
+[]
+access = read : [ * ], write : [ admin, sc_admin ]
+export = system
+
+[savedsearches]
+export = none
+
+# Only admins may read the stored ArangoDB password.
+[passwords]
+access = read : [ admin, sc_admin ], write : [ admin, sc_admin ]
+export = none

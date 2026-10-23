@@ -1,0 +1,15 @@
+offset_s,platform,device,user,src,detail_kind,detail,before,after,result
+3000,paloalto,fw-syd-01,jsmith,10.8.1.15,config_diff,set /config/devices/entry/vsys/entry/address/entry[@name='WEB-SRV-01'],,ip-netmask 10.20.30.40/32,Succeeded
+2900,paloalto,fw-syd-01,jsmith,10.8.1.15,config_diff,set /config/devices/entry/vsys/entry/rulebase/security/rules/entry[@name='allow-web-443'],,from DMZ; to WEB; source DMZ-NET; destination WEB-SRV-01; service service-https; action allow,Succeeded
+2700,paloalto,fw-syd-01,jsmith,10.8.1.15,command,commit,,,Succeeded
+2950,paloalto,fw-syd-02,jsmith,10.8.1.15,config_diff,set /config/devices/entry/vsys/entry/address/entry[@name='WEB-SRV-01'],,ip-netmask 10.20.30.40/32,Succeeded
+2850,paloalto,fw-syd-02,jsmith,10.8.1.15,config_diff,set /config/devices/entry/vsys/entry/rulebase/security/rules/entry[@name='allow-web-443'],,from DMZ; to WEB; source DMZ-NET; destination WEB-SRV-01; service service-https; action allow,Succeeded
+2750,paloalto,fw-syd-02,jsmith,10.8.1.15,command,commit,,,Succeeded
+3200,cisco_ios,rtr-mel-01,bwilson,10.9.9.9,command,cmd: ip route 0.0.0.0 0.0.0.0 192.0.2.1,,,
+3150,cisco_ios,rtr-mel-01,bwilson,10.9.9.9,command,cmd: no ip route 0.0.0.0 0.0.0.0 10.60.0.1,,,
+2900,cisco_ios,rtr-mel-01,bwilson,10.9.9.9,notice,configured via vty0,,,
+3100,paloalto,fw-mel-01,akumar,10.8.1.22,config_diff,set /config/devices/entry/vsys/entry/rulebase/security/rules/entry[@name='branch-to-portal'],,from trust; to dmz; source any; destination 10.50.0.10; application any; service any; action allow,Succeeded
+2800,paloalto,fw-mel-01,akumar,10.8.1.22,command,commit,,,Succeeded
+3300,paloalto,fw-per-01,jsmith,10.8.1.15,config_diff,delete /config/devices/entry/vsys/entry/rulebase/security/rules/entry[@name='out-broad'],from trust; to untrust; service tcp-all; action allow,,Succeeded
+3200,paloalto,fw-per-01,jsmith,10.8.1.15,config_diff,set /config/devices/entry/vsys/entry/rulebase/security/rules/entry[@name='out-https'],,from trust; to untrust; service service-https; action allow,Succeeded
+3000,paloalto,fw-per-01,jsmith,10.8.1.15,command,commit,,,Succeeded

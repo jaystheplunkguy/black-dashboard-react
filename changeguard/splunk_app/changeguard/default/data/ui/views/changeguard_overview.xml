@@ -1,0 +1,137 @@
+<dashboard version="2" theme="dark">
+  <label>ChangeGuard AI</label>
+  <description>Splunk detects the facts, the graph explains how they connect, the AI decides what needs human attention.</description>
+  <definition><![CDATA[
+{
+  "title": "ChangeGuard AI",
+  "description": "Network config change assurance",
+  "inputs": {
+    "input_time": {
+      "type": "input.timerange",
+      "title": "Cases first seen",
+      "options": {"token": "tr", "defaultValue": "-7d,now"}
+    },
+    "input_case": {
+      "type": "input.text",
+      "title": "Case id (click a row)",
+      "options": {"token": "case_id", "defaultValue": "*"}
+    },
+    "input_question": {
+      "type": "input.text",
+      "title": "Ask ChangeGuard",
+      "options": {"token": "question", "defaultValue": "Which changes in the last 7 days need attention and why?"}
+    }
+  },
+  "defaults": {
+    "dataSources": {
+      "ds.search": {"options": {"queryParameters": {"earliest": "$tr.earliest$", "latest": "$tr.latest$"}}}
+    }
+  },
+  "dataSources": {
+    "ds_cases": {
+      "type": "ds.search",
+      "options": {
+        "query": "| inputlookup cg_cases_lookup | eval _time=first_seen | addinfo | where _time>=info_min_time AND (_time<=info_max_time OR info_max_time=\"+Infinity\") | fields - info_*",
+        "enableSmartSources": true
+      },
+      "name": "cases"
+    },
+    "ds_kpi_compliant": {"type": "ds.chain", "options": {"extend": "ds_cases", "query": "| where verdict=\"COMPLIANT\" OR verdict=\"COMPLIANT_WATCH\" OR verdict=\"AUTHORISED_OTHER_CHG\" | stats count"}},
+    "ds_kpi_unplanned": {"type": "ds.chain", "options": {"extend": "ds_cases", "query": "| where verdict=\"UNPLANNED_CHANGE\" OR verdict=\"UNAPPROVED\" OR verdict=\"OUT_OF_WINDOW\" OR verdict=\"WRONG_IMPLEMENTER\" | stats count"}},
+    "ds_kpi_deviation": {"type": "ds.chain", "options": {"extend": "ds_cases", "query": "| where verdict=\"IMPLEMENTATION_DEVIATION\" | stats count"}},
+    "ds_kpi_failed": {"type": "ds.chain", "options": {"extend": "ds_cases", "query": "| where verdict=\"POTENTIAL_FAILED_CHANGE\" | stats count"}},
+    "ds_kpi_review": {"type": "ds.chain", "options": {"extend": "ds_cases", "query": "| where status=\"review\" OR status=\"new\" OR status=\"intent_check\" OR status=\"investigate\" OR status=\"impact_check\" | stats count"}},
+    "ds_by_verdict": {"type": "ds.chain", "options": {"extend": "ds_cases", "query": "| eval day=strftime(first_seen, \"%Y-%m-%d\") | chart count OVER day BY verdict"}},
+    "ds_attention": {
+      "type": "ds.chain",
+      "options": {
+        "extend": "ds_cases",
+        "query": "| where status!=\"closed\" | eval first_seen=strftime(first_seen, \"%F %T\"), reasons=mvjoin(reasons, \" | \") | sort - updated_at | table case_id severity verdict status device user chg_number first_seen confidence reasons"
+      }
+    },
+    "ds_case": {
+      "type": "ds.search",
+      "options": {
+        "query": "| inputlookup cg_cases_lookup where case_id=\"$case_id$\" | head 1 | eval first_seen=strftime(first_seen, \"%F %T\"), last_seen=strftime(last_seen, \"%F %T\") | table case_id verdict status severity confidence device ci_name services user itam_user first_seen last_seen chg_number chg_summary authorising_change reasons deviations evidence_refs impact_incident impact_summary impact_score evidence_summary change_log | transpose 0 column_name=field | rename \"row 1\" AS value",
+        "queryParameters": {"earliest": "-1m", "latest": "now"}
+      }
+    },
+    "ds_case_graph": {
+      "type": "ds.search",
+      "options": {
+        "query": "| inputlookup cg_cases_lookup where case_id=\"$case_id$\" | head 1 | cgaql query=case_evidence mode=json out=ev | spath input=ev path={}.edges{} output=edge | mvexpand edge | spath input=edge | table type from to",
+        "queryParameters": {"earliest": "-1m", "latest": "now"}
+      }
+    },
+    "ds_ask": {
+      "type": "ds.search",
+      "options": {
+        "query": "| inputlookup cg_cases_lookup | where first_seen>=relative_time(now(), \"-14d\") | sort - first_seen | head 200 | eval line=strftime(first_seen, \"%F %T\").\" case=\".case_id.\" device=\".device.\" user=\".user.\" verdict=\".verdict.\" status=\".status.\" chg=\".coalesce(chg_number, \"none\").\" reasons=\".coalesce(mvjoin(reasons, \"; \"), \"\") | stats list(line) AS lines | `cg_nl` | eval cg_prompt=\"You are ChangeGuard, a network change-assurance assistant. Answer the operator's question using ONLY the cases below. Quote case ids and CHG numbers. If the answer is not in the data, say so.\".nl.nl.\"QUESTION: \".$question|s$.nl.nl.\"CASES:\".nl.mvjoin(lines, nl) | `cg_llm(cg_prompt, ask)` | table llm_raw | rename llm_raw AS answer",
+        "queryParameters": {"earliest": "-1m", "latest": "now"}
+      }
+    },
+    "ds_risk": {
+      "type": "ds.search",
+      "options": {
+        "query": "| inputlookup cg_change_risk | eval planned_start=strftime(planned_start, \"%F %T\") | sort success_probability | table chg_number summary planned_start implementer success_probability explanation",
+        "queryParameters": {"earliest": "-1m", "latest": "now"}
+      }
+    }
+  },
+  "visualizations": {
+    "viz_title": {
+      "type": "splunk.markdown",
+      "options": {"markdown": "## ChangeGuard AI\nShould this change have happened, did it happen correctly, and did anything bad happen afterwards?"}
+    },
+    "viz_compliant": {"type": "splunk.singlevalue", "title": "🟢 Compliant", "dataSources": {"primary": "ds_kpi_compliant"}, "options": {"majorColor": "#53a051"}},
+    "viz_unplanned": {"type": "splunk.singlevalue", "title": "🔴 Unplanned / unauthorised", "dataSources": {"primary": "ds_kpi_unplanned"}, "options": {"majorColor": "#dc4e41"}},
+    "viz_deviation": {"type": "splunk.singlevalue", "title": "🟠 Implementation deviation", "dataSources": {"primary": "ds_kpi_deviation"}, "options": {"majorColor": "#f1813f"}},
+    "viz_failed": {"type": "splunk.singlevalue", "title": "🟣 Potential failed change", "dataSources": {"primary": "ds_kpi_failed"}, "options": {"majorColor": "#9b59b6"}},
+    "viz_review": {"type": "splunk.singlevalue", "title": "In progress / needs review", "dataSources": {"primary": "ds_kpi_review"}},
+    "viz_by_verdict": {
+      "type": "splunk.column",
+      "title": "Change sessions by verdict",
+      "dataSources": {"primary": "ds_by_verdict"},
+      "options": {
+        "stackMode": "stacked",
+        "seriesColorsByField": {
+          "COMPLIANT": "#53a051", "COMPLIANT_WATCH": "#8fd18b", "AUTHORISED_OTHER_CHG": "#3c9a9a",
+          "UNPLANNED_CHANGE": "#dc4e41", "UNAPPROVED": "#b8372d", "OUT_OF_WINDOW": "#e8836f", "WRONG_IMPLEMENTER": "#c5574a",
+          "IMPLEMENTATION_DEVIATION": "#f1813f", "POTENTIAL_FAILED_CHANGE": "#9b59b6",
+          "UNKNOWN_CI": "#8c8c8c", "NEEDS_REVIEW": "#b0b0b0", "NEW": "#cccccc"
+        }
+      }
+    },
+    "viz_attention": {
+      "type": "splunk.table",
+      "title": "Open cases (click to inspect)",
+      "dataSources": {"primary": "ds_attention"},
+      "eventHandlers": [{"type": "drilldown.setToken", "options": {"tokens": [{"token": "case_id", "key": "row.case_id.value"}]}}]
+    },
+    "viz_case": {"type": "splunk.table", "title": "Case $case_id$", "dataSources": {"primary": "ds_case"}},
+    "viz_case_graph": {"type": "splunk.table", "title": "Evidence graph edges (ArangoDB)", "dataSources": {"primary": "ds_case_graph"}},
+    "viz_ask": {"type": "splunk.table", "title": "Answer", "dataSources": {"primary": "ds_ask"}, "options": {"columnFormat": {"answer": {"width": 1100}}}},
+    "viz_risk": {"type": "splunk.table", "title": "Proposed changes: probability of success (scenario 06)", "dataSources": {"primary": "ds_risk"}}
+  },
+  "layout": {
+    "type": "grid",
+    "globalInputs": ["input_time", "input_case", "input_question"],
+    "structure": [
+      {"item": "viz_title", "type": "block", "position": {"x": 0, "y": 0, "w": 1200, "h": 70}},
+      {"item": "viz_compliant", "type": "block", "position": {"x": 0, "y": 70, "w": 240, "h": 110}},
+      {"item": "viz_unplanned", "type": "block", "position": {"x": 240, "y": 70, "w": 240, "h": 110}},
+      {"item": "viz_deviation", "type": "block", "position": {"x": 480, "y": 70, "w": 240, "h": 110}},
+      {"item": "viz_failed", "type": "block", "position": {"x": 720, "y": 70, "w": 240, "h": 110}},
+      {"item": "viz_review", "type": "block", "position": {"x": 960, "y": 70, "w": 240, "h": 110}},
+      {"item": "viz_by_verdict", "type": "block", "position": {"x": 0, "y": 180, "w": 1200, "h": 260}},
+      {"item": "viz_attention", "type": "block", "position": {"x": 0, "y": 440, "w": 1200, "h": 320}},
+      {"item": "viz_case", "type": "block", "position": {"x": 0, "y": 760, "w": 700, "h": 520}},
+      {"item": "viz_case_graph", "type": "block", "position": {"x": 700, "y": 760, "w": 500, "h": 520}},
+      {"item": "viz_ask", "type": "block", "position": {"x": 0, "y": 1280, "w": 1200, "h": 220}},
+      {"item": "viz_risk", "type": "block", "position": {"x": 0, "y": 1500, "w": 1200, "h": 260}}
+    ]
+  }
+}
+  ]]></definition>
+  <meta type="hiddenElements"><![CDATA[{"hideEdit": false, "hideOpenInSearch": false, "hideExport": false}]]></meta>
+</dashboard>

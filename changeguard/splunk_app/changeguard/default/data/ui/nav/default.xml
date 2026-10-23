@@ -1,0 +1,9 @@
+<nav search_view="search" color="#1e2a4a">
+  <view name="changeguard_overview" default="true" />
+  <view name="search" />
+  <collection label="Pipeline">
+    <saved source="unclassified" match="CG - " />
+  </collection>
+  <view name="reports" />
+  <view name="alerts" />
+</nav>

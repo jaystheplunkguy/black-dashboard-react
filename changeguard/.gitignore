@@ -1,0 +1,9 @@
+# Splunk writes these at runtime; never commit credentials or local overrides
+splunk_app/changeguard/local/
+splunk_app/changeguard/metadata/local.meta
+# vendored by build.sh
+splunk_app/changeguard/bin/lib/
+dist/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
