@@ -7,3 +7,5 @@ dist/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+splunk_app/changeguard_dev_stubs/local/
+splunk_app/changeguard_dev_stubs/metadata/local.meta

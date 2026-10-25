@@ -1,0 +1,14 @@
+CI_Name,CI,Category,Type,Name,Site,Region,EnvironmentType,SystemRole,InstanceId
+nspvmp1822da01.nsp.com.au,nspvmp1822da01,Network,Firewall Manager,Panorama,1822DA,NSW,Production,Panorama,OI-0001
+nspnfp4aherb01.nsp.com.au,nspnfp4aherb01,Network,Firewall,PA-5220,4AHERB,VIC,Production,Firewall,OI-0002
+nspnfp4aherb02.nsp.com.au,nspnfp4aherb02,Network,Firewall,PA-5220,4AHERB,VIC,Production,Firewall,OI-0003
+nspvfp1822da01.nsp.com.au,nspvfp1822da01,Network,Firewall,PA-VM,1822DA,NSW,Production,Firewall,OI-0004
+nspvfp1822da02.nsp.com.au,nspvfp1822da02,Network,Firewall,PA-VM,1822DA,NSW,Production,Firewall,OI-0005
+nspnfp7perb01.nsp.com.au,nspnfp7perb01,Network,Firewall,PA-3220,7PERB,WA,Production,Firewall,OI-0006
+nspnfp7perb02.nsp.com.au,nspnfp7perb02,Network,Firewall,PA-3220,7PERB,WA,Production,Firewall,OI-0007
+nsprtr-mel-01.nsp.com.au,nsprtr-mel-01,Network,Router,ASR1001,MEL,VIC,Production,Router,OI-0008
+nsprtr-syd-02.nsp.com.au,nsprtr-syd-02,Network,Router,ASR1001,SYD,NSW,Production,Router,OI-0009
+lb-per-01.nsp.com.au,lb-per-01,Network,Load Balancer,F5,7PERB,WA,Production,LTM,OI-0010
+web-portal-app.nsp.com.au,web-portal-app,Application,Application,Web Portal App,1822DA,NSW,Production,App,OI-0011
+Payments API,payments api,Business Service,Business Service,Payments API,,,Production,Service,OI-0012
+Customer Web Portal,customer web portal,Business Service,Business Service,Customer Web Portal,,,Production,Service,OI-0013

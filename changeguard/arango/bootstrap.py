@@ -14,30 +14,30 @@ from changeguard_core.config import client_from_env  # noqa: E402
 
 GRAPH = "changeguard"
 
-VERTICES = ["devices", "cis", "services", "changes", "incidents", "people", "cases"]
+VERTICES = ["devices", "cis", "changes", "incidents", "people", "cases"]
 
 # collection, from, to
 EDGES = [
     ("device_is", ["devices"], ["cis"]),
-    ("ci_rel", ["cis", "services"], ["cis", "services"]),
-    ("chg_affects", ["changes"], ["cis", "services"]),
-    ("inc_on", ["incidents"], ["cis", "services"]),
+    ("ci_rel", ["cis"], ["cis"]),
+    ("chg_affects", ["changes"], ["devices", "cis"]),
+    ("inc_on", ["incidents"], ["cis"]),
     ("implemented_by", ["changes"], ["people"]),
     ("ha_peer", ["devices"], ["devices"]),
     ("case_on", ["cases"], ["devices"]),
     ("case_matched", ["cases"], ["changes"]),
-    ("case_related", ["cases"], ["changes", "incidents", "cis", "services"]),
+    ("case_related", ["cases"], ["changes", "incidents", "cis"]),
 ]
 
 INDEXES = [
-    ("cis", ["name"]),
+    ("cis", ["CI"]),
     ("changes", ["planned_start"]),
     ("changes", ["created_at"]),
     ("changes", ["implementer"]),
     ("incidents", ["opened_at"]),
     ("cases", ["status"]),
     ("cases", ["verdict"]),
-    ("cases", ["device"]),
+    ("cases", ["session_device"]),
     ("cases", ["first_seen"]),
     ("cases", ["itam_user"]),
 ]

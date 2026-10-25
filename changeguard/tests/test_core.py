@@ -93,19 +93,18 @@ def test_every_query_declares_exactly_its_bind_params(name):
 
 
 def test_bind_converts_types_and_applies_defaults():
-    vars_ = bind(QUERIES["best_change"], {"device": "FW-SYD-01.corp", "first_seen": "10.5", "last_seen": "20"})
-    assert vars_ == {"device": "fw-syd-01", "first_seen": 10.5, "last_seen": 20, "itam_user": None,
-                     "slack": 1800, "horizon": 604800}
-    assert bind(QUERIES["alt_explanations"], {"device": "d", "first_seen": 1, "last_seen": 2,
+    vars_ = bind(QUERIES["downstream_incidents"], {"devices": ["FW-A.corp", "fw-b", "fw-a"], "last_seen": "10.5"})
+    assert vars_ == {"devices": ["fw-a", "fw-b"], "last_seen": 10.5, "horizon": 259200, "max_hops": 2, "exclude": []}
+    assert bind(QUERIES["alt_explanations"], {"devices": "d", "first_seen": 1, "last_seen": 2,
                                               "chg_refs": "CRQ1, CRQ2"})["chg_refs"] == ["CRQ1", "CRQ2"]
     with pytest.raises(ValueError):
-        bind(QUERIES["best_change"], {"device": "x"})
+        bind(QUERIES["downstream_incidents"], {"devices": "x"})
 
 
 def test_param_types_are_known():
     for query in QUERIES.values():
         for name, (kind, _) in query.params.items():
-            assert kind in ("host", "key", "str", "num", "list"), (query.name, name)
+            assert kind in ("host", "hosts", "key", "str", "num", "list"), (query.name, name)
 
 
 # --- commands -------------------------------------------------------------------
@@ -124,28 +123,28 @@ def test_write_chunk_annotates_rows_and_marks_errors():
 
 
 def test_enrich_modes():
-    rows = [{"device": "fw-a", "first_seen": "1", "last_seen": "2"}, {"device": "fw-b", "first_seen": "1", "last_seen": "2"}]
-    client = FakeClient(results=[[{"chg_number": "CRQ1", "in_window": True}], []])
-    out = enrich(client, [dict(r) for r in rows], "best_change", prefix="m_")
-    assert out[0]["m_chg_number"] == "CRQ1" and out[0]["m_in_window"] == "true"
-    assert out[1]["m_chg_number"] is None and out[1]["m_count"] == 0  # uniform columns
+    rows = [{"devices": ["fw-a"], "last_seen": "2"}, {"devices": "fw-b", "last_seen": "2"}]
+    client = FakeClient(results=[[{"top_incident": "INC1", "found": True}], []])
+    out = enrich(client, [dict(r) for r in rows], "downstream_incidents", prefix="w_")
+    assert out[0]["w_top_incident"] == "INC1" and out[0]["w_found"] == "true"
+    assert out[1]["w_top_incident"] is None and out[1]["w_count"] == 0  # uniform columns
 
     client = FakeClient(results=[[{"a": 1}, {"a": 2}]])
-    out = enrich(client, [dict(rows[0])], "best_change", mode="all")
+    out = enrich(client, [dict(rows[0])], "downstream_incidents", mode="all")
     assert [r["a"] for r in out] == [1, 2]
 
     client = FakeClient(results=[[{"a": 1}]])
-    out = enrich(client, [dict(rows[0])], "best_change", mode="json", out_field="j")
+    out = enrich(client, [dict(rows[0])], "downstream_incidents", mode="json", out_field="j")
     assert json.loads(out[0]["j"]) == [{"a": 1}]
 
 
 def test_enrich_param_mapping_and_errors():
     client = FakeClient(results=[[]])
-    enrich(client, [{"device": "fw-a", "last_seen": "5", "dismissed_incidents": ["INC1", "INC2"]}],
-           "downstream_incidents", param_map="exclude=dismissed_incidents")
-    assert client.queries[0][1]["exclude"] == ["INC1", "INC2"]
+    enrich(client, [{"doi": ["fw-a"], "last_seen": "5", "dismissed_incidents": ["INC1", "INC2"]}],
+           "downstream_incidents", param_map="exclude=dismissed_incidents,devices=doi")
+    assert client.queries[0][1]["exclude"] == ["INC1", "INC2"] and client.queries[0][1]["devices"] == ["fw-a"]
 
-    out = enrich(FakeClient(), [{"device": "fw-a"}], "best_change")  # missing first_seen
+    out = enrich(FakeClient(), [{"devices": "fw-a"}], "downstream_incidents")  # missing last_seen
     assert "needs parameter" in out[0]["aql_error"]
     with pytest.raises(ValueError):
         enrich(FakeClient(), [{}], "no_such_query")

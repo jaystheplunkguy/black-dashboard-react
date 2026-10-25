@@ -1,15 +1,23 @@
-offset_s,platform,device,user,src,detail_kind,detail,before,after,result
-3000,paloalto,fw-syd-01,jsmith,10.8.1.15,config_diff,set /config/devices/entry/vsys/entry/address/entry[@name='WEB-SRV-01'],,ip-netmask 10.20.30.40/32,Succeeded
-2900,paloalto,fw-syd-01,jsmith,10.8.1.15,config_diff,set /config/devices/entry/vsys/entry/rulebase/security/rules/entry[@name='allow-web-443'],,from DMZ; to WEB; source DMZ-NET; destination WEB-SRV-01; service service-https; action allow,Succeeded
-2700,paloalto,fw-syd-01,jsmith,10.8.1.15,command,commit,,,Succeeded
-2950,paloalto,fw-syd-02,jsmith,10.8.1.15,config_diff,set /config/devices/entry/vsys/entry/address/entry[@name='WEB-SRV-01'],,ip-netmask 10.20.30.40/32,Succeeded
-2850,paloalto,fw-syd-02,jsmith,10.8.1.15,config_diff,set /config/devices/entry/vsys/entry/rulebase/security/rules/entry[@name='allow-web-443'],,from DMZ; to WEB; source DMZ-NET; destination WEB-SRV-01; service service-https; action allow,Succeeded
-2750,paloalto,fw-syd-02,jsmith,10.8.1.15,command,commit,,,Succeeded
-3200,cisco_ios,rtr-mel-01,bwilson,10.9.9.9,command,cmd: ip route 0.0.0.0 0.0.0.0 192.0.2.1,,,
-3150,cisco_ios,rtr-mel-01,bwilson,10.9.9.9,command,cmd: no ip route 0.0.0.0 0.0.0.0 10.60.0.1,,,
-2900,cisco_ios,rtr-mel-01,bwilson,10.9.9.9,notice,configured via vty0,,,
-3100,paloalto,fw-mel-01,akumar,10.8.1.22,config_diff,set /config/devices/entry/vsys/entry/rulebase/security/rules/entry[@name='branch-to-portal'],,from trust; to dmz; source any; destination 10.50.0.10; application any; service any; action allow,Succeeded
-2800,paloalto,fw-mel-01,akumar,10.8.1.22,command,commit,,,Succeeded
-3300,paloalto,fw-per-01,jsmith,10.8.1.15,config_diff,delete /config/devices/entry/vsys/entry/rulebase/security/rules/entry[@name='out-broad'],from trust; to untrust; service tcp-all; action allow,,Succeeded
-3200,paloalto,fw-per-01,jsmith,10.8.1.15,config_diff,set /config/devices/entry/vsys/entry/rulebase/security/rules/entry[@name='out-https'],,from trust; to untrust; service service-https; action allow,Succeeded
-3000,paloalto,fw-per-01,jsmith,10.8.1.15,command,commit,,,Succeeded
+offset_s,platform,device,user,src,cmd,path,comment,result,msg
+3000,paloalto,nspvmp1822da01,usera,10.165.7.96,set,/config/devices/entry[@name='localhost.localdomain']/device-group/entry[@name='DG-AHERB']/pre-rulebase/security/rules/entry[@name='allow-web-443'],,Succeeded,
+2950,paloalto,nspvmp1822da01,usera,10.165.7.96,edit,/config/devices/entry[@name='localhost.localdomain']/device-group/entry[@name='DG-AHERB']/pre-rulebase/security/rules/entry[@name='allow-web-443']/service,,Succeeded,
+2900,paloalto,nspvmp1822da01,usera,10.165.7.96,commit,,,Submitted,
+2850,paloalto,nspvmp1822da01,usera,10.165.7.96,commit-and-push,,CRQ000001001 publish WEB-SRV-01,Submitted,
+2800,paloalto,nspnfp4aherb01,usera,,commit-all,,,Succeeded,
+2800,paloalto,nspnfp4aherb02,usera,,commit-all,,,Succeeded,
+3100,paloalto,nspnfp4aherb02,usera,10.165.7.96,set,/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='vsys1']/rulebase/security/rules/entry[@name='allow-web-443'],,Succeeded,
+3050,paloalto,nspnfp4aherb02,usera,10.165.7.96,commit,,,Submitted,
+3200,cisco_ios,nsprtr-mel-01,userb,10.9.9.9,config,,,,Configured from console by userb on vty0 (10.9.9.9)
+3300,paloalto,nspvmp1822da01,userc,10.165.7.97,edit,/config/devices/entry[@name='localhost.localdomain']/device-group/entry[@name='DG-1822DA']/pre-rulebase/security/rules/entry[@name='branch-to-portal']/source,,Succeeded,
+3280,paloalto,nspvmp1822da01,userc,10.165.7.97,set,/config/devices/entry[@name='localhost.localdomain']/device-group/entry[@name='DG-1822DA']/pre-rulebase/security/rules/entry[@name='allow-any-temp'],,Succeeded,
+3200,paloalto,nspvmp1822da01,userc,10.165.7.97,commit,,,Submitted,
+3150,paloalto,nspvmp1822da01,userc,10.165.7.97,commit-and-push,,CRQ000001003,Submitted,
+3100,paloalto,nspvfp1822da01,userc,,commit-all,,,Succeeded,
+3100,paloalto,nspvfp1822da02,userc,,commit-all,,,Succeeded,
+3500,paloalto,nspvmp1822da01,userd,10.165.7.98,delete,/config/devices/entry[@name='localhost.localdomain']/device-group/entry[@name='DG-7PERB']/post-rulebase/security/rules/entry[@name='out-broad'],,Succeeded,
+3480,paloalto,nspvmp1822da01,userd,10.165.7.98,set,/config/devices/entry[@name='localhost.localdomain']/device-group/entry[@name='DG-7PERB']/post-rulebase/security/rules/entry[@name='out-https'],,Succeeded,
+3450,paloalto,nspvmp1822da01,userd,10.165.7.98,commit-and-push,,CALM-1004 PCI hardening,Submitted,
+3400,paloalto,nspnfp7perb01,userd,,commit-all,,,Succeeded,
+3400,paloalto,nspnfp7perb02,userd,,commit-all,,,Succeeded,
+2900,cisco_ios,nsprtr-syd-02,svc_netauto,10.20.0.5,config,,,,Configured from console by svc_netauto on vty1 (10.20.0.5)
+3000,cisco_ftd,nspftd-bne-09,jane.doe@nsp.com.au,,audit,,,,"mojo_server.pl: jane.doe@nsp.com.au@10.2.2.2, Policies > Access Control > Save Policy"

@@ -1,19 +1,25 @@
 """Named, parameterised AQL queries: the only AQL ChangeGuard runs.
 
-Splunk (`| cgaql query=<name>`) and the MCP server both call these by name,
-so no free-form AQL ever reaches the database and the agent's tools and
-the scheduled pipeline always answer a question the same way.
+The graph answers *relationship* questions only (HA peers, related CIs,
+downstream impact, evidence trail). The deterministic CHG checks (exists,
+approved, implementer, window) are done in SPL against the cg_changes KV store.
 
-Graph direction conventions (see arango/bootstrap.py):
-  device_is      devices  -> cis          hostname normalisation happens once, here
-  ci_rel         provider -> consumer     impact flows along the edge (firewall -> app -> service)
-  chg_affects    changes  -> cis|services
-  inc_on         incidents -> cis|services
-  implemented_by changes  -> people
-  ha_peer        devices  -> devices      treat as undirected (ANY)
-  case_on        cases    -> devices
-  case_matched   cases    -> changes      the CHG the verdict is based on
-  case_related   cases    -> changes|incidents   other evidence, with e.reason / e.score
+Splunk (`cg_aq*` macros -> `| cgaql query=<name>`) and the MCP server call these
+by name, so no free-form AQL reaches the database.
+
+Graph conventions (arango/bootstrap.py):
+  devices   _key = normalised short hostname (cg_norm_host)
+  cis       _key = itam_ci_lookup CI_Name;  is_service / is_network flags
+  changes   _key = change id (CRQ..., CALM id)
+  device_is      devices -> cis
+  ci_rel         provider -> consumer (impact flows along the edge: firewall -> app -> service)
+  chg_affects    changes -> devices (always) and -> cis (when the CI is known)
+  inc_on         incidents -> cis
+  implemented_by changes -> people
+  ha_peer        devices -> devices (treat as undirected)
+  case_on        cases -> devices (role = session | target)
+  case_matched   cases -> changes (the CHG the verdict is based on)
+  case_related   cases -> changes | incidents (other evidence, e.reason / e.score)
 All times are epoch seconds.
 """
 
@@ -24,10 +30,12 @@ from .keys import normalise_host, safe_key
 DAY = 86400
 FAILED_VERDICTS = ["POTENTIAL_FAILED_CHANGE", "IMPLEMENTATION_DEVIATION", "UNPLANNED_CHANGE"]
 
-# Compact change projection reused by several queries.
-_CHG = """{chg_number: c._key, summary: c.summary, status: c.status, approval: c.approval,
-           chg_class: c.chg_class, implementer: c.implementer,
+# Compact change projection reused by several queries (c = change document).
+_CHG = """{chg_number: c._key, source: c.source, summary: c.summary, status: c.status, approval: c.approval,
+           implementer: c.implementer, imp_group: c.imp_group,
            planned_start: c.planned_start, planned_end: c.planned_end, created_at: c.created_at"""
+
+REQUIRED = object()
 
 
 class Query(object):
@@ -35,26 +43,28 @@ class Query(object):
         self.name = name
         self.description = description
         self.aql = aql
-        # params: {name: (type, default)}; default REQUIRED means the caller must supply it.
+        # params: {name: (type, default)}; REQUIRED means the caller must supply it.
         self.params = params
 
 
-REQUIRED = object()
+def _first(value):
+    return value[0] if isinstance(value, list) else value
 
 
 def _convert(kind, value):
     if value is None or value == "" or value == []:
-        if kind == "list":
-            return []
-        return None
+        return [] if kind in ("list", "hosts") else None
     if kind == "host":
-        return safe_key(normalise_host(value if not isinstance(value, list) else value[0]))
+        return safe_key(normalise_host(_first(value)))
+    if kind == "hosts":
+        items = value if isinstance(value, list) else str(value).split(",")
+        return sorted({safe_key(normalise_host(v)) for v in items if str(v).strip()})
     if kind == "key":
-        return safe_key(value if not isinstance(value, list) else value[0])
+        return safe_key(_first(value))
     if kind == "str":
-        return str(value if not isinstance(value, list) else value[0])
+        return str(_first(value))
     if kind == "num":
-        number = float(value if not isinstance(value, list) else value[0])
+        number = float(_first(value))
         return int(number) if number.is_integer() else number
     if kind == "list":
         items = value if isinstance(value, list) else str(value).split(",")
@@ -70,7 +80,7 @@ def bind(query, values):
         if raw is None or raw == "" or raw == []:
             if default is REQUIRED:
                 raise ValueError("query %s needs parameter '%s'" % (query.name, name))
-            bind_vars[name] = default if not callable(default) else default()
+            bind_vars[name] = default
             continue
         bind_vars[name] = _convert(kind, raw)
     return bind_vars
@@ -87,173 +97,103 @@ def _register(name, description, params, aql):
     QUERIES[name] = Query(name, description, aql, params)
 
 
-# --- L4: scenarios 01-03 ---------------------------------------------------
-
-_register(
-    "best_change",
-    "Best-matching CHG for a change session on a device (window, approval, implementer).",
-    {
-        "device": ("host", REQUIRED),
-        "first_seen": ("num", REQUIRED),
-        "last_seen": ("num", REQUIRED),
-        "itam_user": ("str", None),
-        "slack": ("num", 1800),
-        "horizon": ("num", 7 * DAY),
-    },
-    """
-LET dev = FIRST(FOR d IN devices FILTER d._key == @device RETURN d)
-LET cis = dev == null ? [] : (FOR ci IN 1..1 OUTBOUND dev device_is RETURN ci)
-LET services = UNIQUE(
-  FOR ci IN cis
-    FOR v IN 0..3 OUTBOUND ci ci_rel
-      FILTER IS_SAME_COLLECTION("services", v)
-      RETURN v.name)
-LET candidates = (
-  FOR ci IN cis
-    FOR c IN 1..1 INBOUND ci chg_affects
-      LET start = NOT_NULL(c.planned_start, c.actual_start)
-      LET finish = NOT_NULL(c.planned_end, c.actual_end, start)
-      FILTER start != null
-      FILTER start <= @last_seen + @horizon AND finish >= @first_seen - @horizon
-      LET in_window = @first_seen >= start - @slack AND @last_seen <= finish + @slack
-      LET approved = (c.approval == "Approved" OR c.chg_class == "Standard")
-                     AND c.status NOT IN ["Cancelled", "Rejected", "Draft"]
-      LET user_ok = @itam_user != null AND LOWER(c.implementer) == LOWER(@itam_user)
-      LET score = (in_window ? 4 : 0) + (approved ? 2 : 0) + (user_ok ? 1 : 0)
-      SORT score DESC, ABS(start - @first_seen) ASC
-      RETURN {c, ci, start, finish, in_window, approved, user_ok, score})
-LET best = FIRST(candidates)
-RETURN {
-  device_found: dev != null,
-  ci_count: LENGTH(cis),
-  ci_key: FIRST(cis)._key,
-  ci_name: FIRST(cis).name,
-  services: services,
-  candidate_count: LENGTH(candidates),
-  chg_number: best.c._key,
-  chg_summary: best.c.summary,
-  chg_status: best.c.status,
-  chg_approval: best.c.approval,
-  chg_class: best.c.chg_class,
-  chg_implementer: best.c.implementer,
-  planned_start: best.start,
-  planned_end: best.finish,
-  in_window: best.in_window,
-  approved: best.approved,
-  user_ok: best.user_ok,
-  match_score: best.score
-}
-""",
-)
-
-_register(
-    "change_detail",
-    "Full text of a change (summary, description, implementation plan) for the intent check.",
-    {"chg_number": ("key", REQUIRED)},
-    """
-FOR c IN changes FILTER c._key == @chg_number
-  RETURN {chg_number: c._key, summary: c.summary, description: c.description,
-          plan: c.plan, chg_class: c.chg_class, risk: c.risk, implementer: c.implementer,
-          planned_start: c.planned_start, planned_end: c.planned_end}
-""",
-)
-
-# --- L4/L5b: scenario 02 -------------------------------------------------------
+# --- Scenario 02: other explanations for a change with no matching CHG ------
 
 _register(
     "alt_explanations",
-    "Other credible authorisations for a change with no matching CHG: HA peer CHGs, CHGs on "
-    "related CIs, the engineer's own CHGs on other CIs, CHGs raised afterwards, CHG numbers in the config text.",
+    "Other credible authorisations for a change session with no in-window CHG: CHGs on its devices near "
+    "the time, on HA peers (graph), on related CIs, the engineer's CHGs elsewhere, CHGs raised afterwards, "
+    "and CHG numbers referenced in the commit comment.",
     {
-        "device": ("host", REQUIRED),
+        "devices": ("hosts", REQUIRED),
         "first_seen": ("num", REQUIRED),
         "last_seen": ("num", REQUIRED),
         "itam_user": ("str", None),
         "chg_refs": ("list", []),
         "slack": ("num", 1800),
-        "window": ("num", DAY),
+        "before": ("num", 2 * DAY),
+        "after": ("num", DAY),
         "late": ("num", 2 * DAY),
     },
     """
-LET dev = FIRST(FOR d IN devices FILTER d._key == @device RETURN d)
-LET my_cis = dev == null ? [] : (FOR ci IN 1..1 OUTBOUND dev device_is RETURN ci)
-LET peers = dev == null ? [] : (FOR p IN 1..1 ANY dev ha_peer RETURN p)
+LET devs = (FOR d IN devices FILTER d._key IN @devices RETURN d)
+LET peers = UNIQUE(FOR d IN devs FOR p IN 1..1 ANY d ha_peer FILTER p._key NOT IN @devices RETURN p)
+LET own_related = (
+  FOR d IN devs
+    FOR c IN 1..1 INBOUND d chg_affects
+      FILTER c.planned_start != null
+      FILTER c.planned_start >= @first_seen - @before AND NOT_NULL(c.planned_end, c.planned_start) <= @last_seen + @after
+      RETURN MERGE(%(chg)s}, {why: CONCAT("CHG on ", d._key, " near the time but not covering the change window")}))
 LET peer_chgs = (
   FOR p IN peers
-    FOR ci IN 1..1 OUTBOUND p device_is
-      FOR c IN 1..1 INBOUND ci chg_affects
-        LET start = NOT_NULL(c.planned_start, c.actual_start)
-        FILTER start != null AND ABS(start - @first_seen) < @window
-        RETURN MERGE(%(chg)s}, {why: CONCAT("CHG on HA peer ", p._key)}))
+    FOR c IN 1..1 INBOUND p chg_affects
+      FILTER c.planned_start != null AND ABS(c.planned_start - @first_seen) < @before
+      RETURN MERGE(%(chg)s}, {why: CONCAT("CHG on HA peer ", p._key)}))
 LET neighbour_chgs = (
-  FOR ci IN my_cis
-    FOR n IN 1..1 ANY ci ci_rel
-      FOR c IN 1..1 INBOUND n chg_affects
-        LET start = NOT_NULL(c.planned_start, c.actual_start)
-        FILTER start != null
-        FILTER @first_seen >= start - @slack AND @last_seen <= NOT_NULL(c.planned_end, start) + @slack
-        RETURN MERGE(%(chg)s}, {why: CONCAT("CHG in window on related CI ", n.name)}))
+  FOR d IN devs
+    FOR ci IN 1..1 OUTBOUND d device_is
+      FOR n IN 1..1 ANY ci ci_rel
+        FOR c IN 1..1 INBOUND n chg_affects
+          FILTER c.planned_start != null
+          FILTER @first_seen >= c.planned_start - @slack AND @last_seen <= NOT_NULL(c.planned_end, c.planned_start) + @slack
+          RETURN MERGE(%(chg)s}, {why: CONCAT("CHG in window on related CI ", n.CI_Name)}))
 LET person_chgs = (
   FOR person IN people FILTER person._key == @itam_user
     FOR c IN 1..1 INBOUND person implemented_by
-      LET start = NOT_NULL(c.planned_start, c.actual_start)
-      FILTER start != null
-      FILTER @first_seen >= start - @slack AND @last_seen <= NOT_NULL(c.planned_end, start) + @slack
-      RETURN MERGE(%(chg)s}, {why: "Engineer's own CHG in window on another CI (missing CI association?)"}))
+      FILTER c.planned_start != null
+      FILTER @first_seen >= c.planned_start - @slack AND @last_seen <= NOT_NULL(c.planned_end, c.planned_start) + @slack
+      RETURN MERGE(%(chg)s}, {why: "Engineer's own CHG in window on another device (missing CI association?)"}))
 LET late_chgs = (
-  FOR ci IN my_cis
-    FOR c IN 1..1 INBOUND ci chg_affects
+  FOR d IN devs
+    FOR c IN 1..1 INBOUND d chg_affects
       FILTER c.created_at > @first_seen AND c.created_at < @first_seen + @late
       RETURN MERGE(%(chg)s}, {why: "CHG raised after the change (retrospective)"}))
 LET ref_chgs = (
   FOR k IN @chg_refs
     FOR c IN changes FILTER c._key == k
-      RETURN MERGE(%(chg)s}, {why: "CHG number referenced in the config/commit text"}))
-LET cands = UNION(peer_chgs, neighbour_chgs, person_chgs, late_chgs, ref_chgs)
+      RETURN MERGE(%(chg)s}, {why: "CHG number referenced in the commit comment"}))
+LET cands = UNION(own_related, peer_chgs, neighbour_chgs, person_chgs, late_chgs, ref_chgs)
 RETURN {
-  peer_count: LENGTH(peer_chgs),
-  neighbour_count: LENGTH(neighbour_chgs),
-  person_count: LENGTH(person_chgs),
-  late_count: LENGTH(late_chgs),
-  ref_count: LENGTH(ref_chgs),
+  own_related_count: LENGTH(own_related), peer_count: LENGTH(peer_chgs), neighbour_count: LENGTH(neighbour_chgs),
+  person_count: LENGTH(person_chgs), late_count: LENGTH(late_chgs), ref_count: LENGTH(ref_chgs),
   total: LENGTH(cands),
-  ha_peers: peers[*]._key,
+  graph_ha_peers: peers[*]._key,
   candidate_keys: UNIQUE(cands[*].chg_number),
   evidence: cands
 }
 """ % {"chg": _CHG},
 )
 
-# --- L6: scenario 04 -----------------------------------------------------------
+# --- Scenario 04: downstream incidents ------------------------------------------
 
 _register(
     "downstream_incidents",
-    "Incidents on the device's CI or up to max_hops downstream, opened after the change, ranked by "
-    "a score of hops x delay x priority.",
+    "Incidents on the devices' CIs or up to max_hops downstream, opened after last_seen, ranked by "
+    "hops x delay x priority.",
     {
-        "device": ("host", REQUIRED),
+        "devices": ("hosts", REQUIRED),
         "last_seen": ("num", REQUIRED),
         "horizon": ("num", 3 * DAY),
         "max_hops": ("num", 2),
         "exclude": ("list", []),
     },
     """
-LET dev = FIRST(FOR d IN devices FILTER d._key == @device RETURN d)
-LET hits = dev == null ? [] : (
-  FOR ci IN 1..1 OUTBOUND dev device_is
-    FOR v, e, p IN 0..3 OUTBOUND ci ci_rel
-      LET hops = LENGTH(p.edges)
-      FILTER hops <= @max_hops
-      FOR inc IN 1..1 INBOUND v inc_on
-        FILTER inc.opened_at > @last_seen AND inc.opened_at < @last_seen + @horizon
-        FILTER inc._key NOT IN @exclude
-        LET delay_min = (inc.opened_at - @last_seen) / 60
-        LET w_hops = hops == 0 ? 1.0 : (hops == 1 ? 0.7 : (hops == 2 ? 0.5 : 0.3))
-        LET w_delay = delay_min <= 60 ? 1.0 : (delay_min <= 240 ? 0.7 : (delay_min <= 1440 ? 0.4 : 0.2))
-        LET w_prio = inc.priority == 1 ? 1.0 : (inc.priority == 2 ? 0.8 : (inc.priority == 3 ? 0.5 : 0.3))
-        RETURN {incident: inc._key, summary: inc.summary, priority: inc.priority,
-                opened_at: inc.opened_at, hops: hops, via: v.name, via_id: v._id,
-                delay_min: ROUND(delay_min), score: ROUND(w_hops * w_delay * w_prio * 100) / 100})
+LET hits = (
+  FOR d IN devices FILTER d._key IN @devices
+    FOR ci IN 1..1 OUTBOUND d device_is
+      FOR v, e, p IN 0..3 OUTBOUND ci ci_rel
+        LET hops = LENGTH(p.edges)
+        FILTER hops <= @max_hops
+        FOR inc IN 1..1 INBOUND v inc_on
+          FILTER inc.opened_at > @last_seen AND inc.opened_at < @last_seen + @horizon
+          FILTER inc._key NOT IN @exclude
+          LET delay_min = (inc.opened_at - @last_seen) / 60
+          LET w_hops = hops == 0 ? 1.0 : (hops == 1 ? 0.7 : (hops == 2 ? 0.5 : 0.3))
+          LET w_delay = delay_min <= 60 ? 1.0 : (delay_min <= 240 ? 0.7 : (delay_min <= 1440 ? 0.4 : 0.2))
+          LET w_prio = inc.priority == 1 ? 1.0 : (inc.priority == 2 ? 0.8 : (inc.priority == 3 ? 0.5 : 0.3))
+          RETURN {incident: inc._key, summary: inc.summary, priority: inc.priority, opened_at: inc.opened_at,
+                  hops: hops, via: NOT_NULL(v.Name, v.CI_Name), via_id: v._id, from_device: d._key,
+                  delay_min: ROUND(delay_min), score: ROUND(w_hops * w_delay * w_prio * 100) / 100})
 LET ranked = (
   FOR h IN hits
     COLLECT k = h.incident INTO g = h
@@ -262,47 +202,40 @@ LET ranked = (
     RETURN top)
 LET best = FIRST(ranked)
 RETURN {
-  incident_count: LENGTH(ranked),
-  top_incident: best.incident,
-  top_summary: best.summary,
-  top_priority: best.priority,
-  top_hops: best.hops,
-  top_via: best.via,
-  top_delay_min: best.delay_min,
-  top_score: NOT_NULL(best.score, 0),
-  incident_keys: ranked[*].incident,
-  incidents: ranked
+  incident_count: LENGTH(ranked), top_incident: best.incident, top_summary: best.summary,
+  top_priority: best.priority, top_hops: best.hops, top_via: best.via, top_delay_min: best.delay_min,
+  top_score: NOT_NULL(best.score, 0), incident_keys: ranked[*].incident, incidents: ranked
 }
 """,
 )
 
-# --- L7: evidence package ----------------------------------------------------
+# --- Evidence package ------------------------------------------------------------
 
 _register(
     "case_evidence",
-    "A case's evidence subgraph: device, CIs, HA peers, matched and related changes/incidents, "
-    "downstream services, plus the raw nodes/edges for drawing.",
+    "A case's evidence subgraph: devices (session + targets), CIs, HA peers, matched and related "
+    "changes/incidents, downstream CIs/services, plus raw nodes/edges for drawing.",
     {"case_id": ("key", REQUIRED)},
     """
 FOR k IN cases FILTER k._key == @case_id
-  LET dev = FIRST(FOR v IN 1..1 OUTBOUND k case_on RETURN v)
-  LET cis = dev == null ? [] : (FOR v IN 1..1 OUTBOUND dev device_is RETURN v)
-  LET peers = dev == null ? [] : (FOR v IN 1..1 ANY dev ha_peer RETURN v._key)
+  LET devs = (FOR v, e IN 1..1 OUTBOUND k case_on RETURN {key: v._key, role: e.role})
+  LET cis = UNIQUE(FOR d IN devs FOR v IN 1..1 OUTBOUND CONCAT("devices/", d.key) device_is RETURN v)
+  LET peers = UNIQUE(FOR d IN devs FOR v IN 1..1 ANY CONCAT("devices/", d.key) ha_peer RETURN v._key)
   LET downstream = UNIQUE(
     FOR ci IN cis FOR v, e, p IN 1..3 OUTBOUND ci ci_rel
-      RETURN {name: v.name, id: v._id, hops: LENGTH(p.edges)})
+      RETURN {name: NOT_NULL(v.Name, v.CI_Name), id: v._id, hops: LENGTH(p.edges), service: v.is_service == 1})
   LET matched = (FOR c IN 1..1 OUTBOUND k case_matched RETURN %(chg)s})
   LET related = (
     FOR v, e IN 1..1 OUTBOUND k case_related
-      RETURN {id: v._id, name: NOT_NULL(v.summary, v.name, v._key), reason: e.reason, score: e.score})
+      RETURN {id: v._id, name: NOT_NULL(v.summary, v.Name, v._key), reason: e.reason, score: e.score})
   LET edges = UNIQUE(
-    FOR v, e IN 1..4 OUTBOUND k case_on, case_matched, case_related, device_is, ci_rel, chg_affects
+    FOR v, e IN 1..4 OUTBOUND k case_on, case_matched, case_related, device_is, ci_rel
       OPTIONS {order: "bfs", uniqueVertices: "global"}
       RETURN {from: e._from, to: e._to, type: PARSE_IDENTIFIER(e._id).collection})
   RETURN {
-    case_id: k._key, verdict: k.verdict, status: k.status,
-    device: dev._key, cis: cis[*].name, ha_peers: peers,
-    downstream: downstream, matched_changes: matched, related: related,
+    case_id: k._key, verdict: k.verdict, status: k.status, devices: devs,
+    cis: cis[*].CI_Name, ha_peers: peers, downstream: downstream,
+    matched_changes: matched, related: related,
     nodes: UNIQUE(UNION(edges[*].from, edges[*].to)), edges: edges
   }
 """ % {"chg": _CHG},
@@ -311,22 +244,24 @@ FOR k IN cases FILTER k._key == @case_id
 # --- Agent tools (scenario 05) -------------------------------------------------
 
 _register(
-    "changes_near",
-    "Changes on a device's CIs, its HA peer and directly related CIs whose window overlaps [from_ts, to_ts].",
+    "related_changes",
+    "Changes on a device, its HA peers and directly related CIs whose window overlaps [from_ts, to_ts].",
     {"device": ("host", REQUIRED), "from_ts": ("num", REQUIRED), "to_ts": ("num", REQUIRED)},
     """
 LET dev = FIRST(FOR d IN devices FILTER d._key == @device RETURN d)
-LET own = dev == null ? [] : (FOR ci IN 1..1 OUTBOUND dev device_is RETURN {ci, rel: "own CI"})
-LET peer = dev == null ? [] : (
-  FOR p IN 1..1 ANY dev ha_peer FOR ci IN 1..1 OUTBOUND p device_is RETURN {ci, rel: CONCAT("HA peer ", p._key)})
-LET near = (FOR o IN own FOR n IN 1..1 ANY o.ci ci_rel RETURN {ci: n, rel: CONCAT("related CI ", n.name)})
+LET own = dev == null ? [] : [{v: dev, rel: "device"}]
+LET peer = dev == null ? [] : (FOR p IN 1..1 ANY dev ha_peer RETURN {v: p, rel: CONCAT("HA peer ", p._key)})
+LET near = dev == null ? [] : (
+  FOR ci IN 1..1 OUTBOUND dev device_is FOR n IN 1..1 ANY ci ci_rel
+    RETURN {v: n, rel: CONCAT("related CI ", NOT_NULL(n.Name, n.CI_Name))})
 FOR t IN UNION(own, peer, near)
-  FOR c IN 1..1 INBOUND t.ci chg_affects
-    LET start = NOT_NULL(c.planned_start, c.actual_start)
-    LET finish = NOT_NULL(c.planned_end, c.actual_end, start)
+  FOR c IN 1..1 INBOUND t.v chg_affects
+    LET start = c.planned_start
+    LET finish = NOT_NULL(c.planned_end, start)
     FILTER start != null AND start <= @to_ts AND finish >= @from_ts
-    SORT start
-    RETURN MERGE(%(chg)s}, {ci: t.ci.name, relation: t.rel})
+    COLLECT chg = c, relation = t.rel
+    SORT chg.planned_start
+    RETURN MERGE((LET c = chg RETURN %(chg)s})[0], {relation: relation})
 """ % {"chg": _CHG},
 )
 
@@ -340,10 +275,10 @@ FOR dev IN devices FILTER dev._key == @device
   LET cis = (FOR ci IN 1..1 OUTBOUND dev device_is RETURN ci)
   LET peers = (FOR p IN 1..1 ANY dev ha_peer RETURN p._key)
   LET downstream = UNIQUE(FOR ci IN cis FOR v, e, p IN 1..3 OUTBOUND ci ci_rel
-                            RETURN {name: v.name, hops: LENGTH(p.edges), service: IS_SAME_COLLECTION("services", v)})
+                            RETURN {name: NOT_NULL(v.Name, v.CI_Name), hops: LENGTH(p.edges), service: v.is_service == 1})
   LET upstream = UNIQUE(FOR ci IN cis FOR v, e, p IN 1..2 INBOUND ci ci_rel
-                          RETURN {name: v.name, hops: LENGTH(p.edges)})
-  LET changes = (FOR ci IN cis FOR c IN 1..1 INBOUND ci chg_affects
+                          RETURN {name: NOT_NULL(v.Name, v.CI_Name), hops: LENGTH(p.edges)})
+  LET changes = (FOR c IN 1..1 INBOUND dev chg_affects
                    FILTER NOT_NULL(c.planned_start, 0) >= @now - 30 * 86400
                      AND NOT_NULL(c.planned_start, 0) <= @now + 7 * 86400
                    SORT c.planned_start DESC
@@ -354,17 +289,18 @@ FOR dev IN devices FILTER dev._key == @device
                      RETURN {incident: i._key, summary: i.summary, priority: i.priority, opened_at: i.opened_at})
   LET cases = (FOR k IN 1..1 INBOUND dev case_on SORT k.first_seen DESC LIMIT 20
                  RETURN KEEP(k, "_key", "verdict", "status", "first_seen", "user", "chg_number"))
-  RETURN {device: dev._key, platform: dev.platform, cis: cis[*].name, ci_classes: cis[*].ci_class,
+  RETURN {device: dev._key, platform: dev.platform, role: dev.role, cis: cis[*].CI_Name,
           ha_peers: peers, downstream, upstream, changes, incidents, cases}
 """ % {"chg": _CHG},
 )
 
 _register(
     "list_cases",
-    "ChangeGuard cases, newest first, optionally filtered by status, verdict or device.",
+    "ChangeGuard cases, newest first, optionally filtered by status, verdict, platform or device.",
     {
         "status": ("str", None),
         "verdict": ("str", None),
+        "platform": ("str", None),
         "device": ("host", None),
         "since": ("num", 0),
         "limit": ("num", 25),
@@ -373,12 +309,13 @@ _register(
 FOR k IN cases
   FILTER @status == null OR k.status == @status
   FILTER @verdict == null OR k.verdict == @verdict
-  FILTER @device == null OR k.device == @device
+  FILTER @platform == null OR k.platform == @platform
+  FILTER @device == null OR k.session_device == @device OR @device IN NOT_NULL(k.doi, [])
   FILTER k.first_seen >= @since
   SORT k.first_seen DESC
   LIMIT @limit
-  RETURN KEEP(k, "_key", "device", "user", "platform", "first_seen", "last_seen", "verdict", "status",
-              "chg_number", "confidence", "reasons", "ci_name", "services")
+  RETURN KEEP(k, "_key", "session_device", "targets", "platform", "user", "user_display", "first_seen",
+              "last_seen", "verdict", "status", "severity", "chg_number", "match_via", "confidence", "reasons")
 """,
 )
 
@@ -408,29 +345,32 @@ FOR c IN changes
 
 _register(
     "change_features",
-    "Graph features for the change-success model: CI history, downstream dependents, engineer history. "
-    "Only history before @now and never the change's own cases, so training rows do not leak their label.",
+    "Graph features for the change-success model: device/CI history, downstream dependents, engineer "
+    "history. Only history before @now and never the change's own cases, so training rows do not leak their label.",
     {"chg_number": ("key", REQUIRED), "now": ("num", REQUIRED), "failed_verdicts": ("list", FAILED_VERDICTS)},
     """
 FOR c IN changes FILTER c._key == @chg_number
-  LET cis = (FOR ci IN 1..1 OUTBOUND c chg_affects RETURN ci)
   LET since = @now - 90 * 86400
+  LET targets = (FOR v IN 1..1 OUTBOUND c chg_affects RETURN v)
+  LET devs = targets[* FILTER IS_SAME_COLLECTION("devices", CURRENT)]
+  LET cis = UNIQUE(UNION(targets[* FILTER IS_SAME_COLLECTION("cis", CURRENT)],
+                         (FOR d IN devs FOR ci IN 1..1 OUTBOUND d device_is RETURN ci)))
   LET downstream = LENGTH(UNIQUE(FOR ci IN cis FOR v IN 1..3 OUTBOUND ci ci_rel RETURN v._id))
-  LET ci_changes = LENGTH(UNIQUE(FOR ci IN cis FOR o IN 1..1 INBOUND ci chg_affects
-                                   FILTER o.planned_start >= since AND o.planned_start < @now RETURN o._key))
+  LET dev_changes = LENGTH(UNIQUE(FOR d IN devs FOR o IN 1..1 INBOUND d chg_affects
+                                    FILTER o.planned_start >= since AND o.planned_start < @now RETURN o._key))
   LET ci_incidents = LENGTH(UNIQUE(FOR ci IN cis FOR i IN 1..1 INBOUND ci inc_on
-                                     FILTER i.opened_at >= since RETURN i._key))
-  LET ci_failed = LENGTH(UNIQUE(FOR ci IN cis FOR d IN 1..1 INBOUND ci device_is FOR k IN 1..1 INBOUND d case_on
-                                  FILTER k.verdict IN @failed_verdicts AND k.first_seen >= since AND k.first_seen < @now
-                                  FILTER k.chg_number != c._key RETURN k._key))
+                                     FILTER i.opened_at >= since AND i.opened_at < @now RETURN i._key))
+  LET dev_failed = LENGTH(UNIQUE(FOR d IN devs FOR k IN 1..1 INBOUND d case_on
+                                   FILTER k.verdict IN @failed_verdicts AND k.first_seen >= since AND k.first_seen < @now
+                                   FILTER k.chg_number != c._key RETURN k._key))
   LET eng = (FOR k IN cases FILTER k.itam_user != null AND k.itam_user == c.implementer
                FILTER k.chg_number != c._key AND k.first_seen < @now RETURN k.verdict)
   LET eng_failed = LENGTH(eng[* FILTER CURRENT IN @failed_verdicts])
   RETURN {
-    chg_number: c._key, chg_class: NOT_NULL(c.chg_class, "unknown"), risk: NOT_NULL(c.risk, "unknown"),
-    ci_class: NOT_NULL(FIRST(cis).ci_class, "unknown"), ci_count: LENGTH(cis),
-    downstream_count: downstream, ci_changes_90d: ci_changes, ci_incidents_90d: ci_incidents,
-    ci_fail_rate_90d: ci_changes == 0 ? 0 : ROUND(100 * ci_failed / ci_changes) / 100,
+    chg_number: c._key, source: NOT_NULL(c.source, "unknown"), risk: NOT_NULL(c.risk, "unknown"),
+    ci_category: NOT_NULL(FIRST(cis).Category, "unknown"), device_count: LENGTH(devs),
+    downstream_count: downstream, changes_90d: dev_changes, incidents_90d: ci_incidents,
+    fail_rate_90d: dev_changes == 0 ? 0 : ROUND(100 * dev_failed / dev_changes) / 100,
     implementer_cases: LENGTH(eng),
     implementer_fail_rate: LENGTH(eng) == 0 ? 0 : ROUND(100 * eng_failed / LENGTH(eng)) / 100,
     duration_h: c.planned_end == null OR c.planned_start == null ? 0

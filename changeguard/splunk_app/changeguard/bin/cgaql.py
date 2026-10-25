@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """| cgaql - run a named ChangeGuard AQL query for every row and merge the result in.
 
-    | inputlookup cg_cases_lookup where status="new" | cgaql query=best_change prefix=m_
-    | cgaql query=downstream_incidents params="exclude=dismissed_incidents" prefix=w_
+    | inputlookup cg_cases_lookup where status="watch" | cgaql query=downstream_incidents prefix=w_ params="devices=doi"
+    | cgaql query=alt_explanations prefix=alt_ params="devices=doi"
     | cgaql query=case_evidence mode=json out=evidence_json
 
 Bind parameters are read from fields with the same name (override with params="param=field,...").

@@ -1,0 +1,267 @@
+[
+  {
+    "name": "get_case",
+    "description": "Get a ChangeGuard case (verdict, reasons, confidence, AI output, matched and related changes) and its\nevidence subgraph: session device and push targets, CIs, HA peers, downstream CIs/services, incidents.",
+    "input_schema": {
+      "properties": {
+        "case_id": {
+          "title": "Case Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "case_id"
+      ],
+      "type": "object",
+      "title": "get_caseArguments"
+    }
+  },
+  {
+    "name": "list_cases",
+    "description": "List recent cases, newest first. verdict: COMPLIANT, COMPLIANT_WATCH, AUTHORISED_OTHER_CHG,\nUNPLANNED_CHANGE, UNAPPROVED, OUT_OF_WINDOW, WRONG_IMPLEMENTER, IMPLEMENTATION_DEVIATION,\nPOTENTIAL_FAILED_CHANGE, UNKNOWN_CI, NEEDS_REVIEW. status: new, intent_check, investigate, explain,\nwatch, impact_check, alert, alerted, review, closed. platform: paloalto, cisco_ios, cisco_ftd.",
+    "input_schema": {
+      "properties": {
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
+        },
+        "verdict": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Verdict"
+        },
+        "platform": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Platform"
+        },
+        "device": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Device"
+        },
+        "since_hours": {
+          "default": 168,
+          "title": "Since Hours",
+          "type": "number"
+        },
+        "limit": {
+          "default": 25,
+          "title": "Limit",
+          "type": "integer"
+        }
+      },
+      "type": "object",
+      "title": "list_casesArguments"
+    }
+  },
+  {
+    "name": "find_related_changes",
+    "description": "Change records (CRQ/CALM) on a device, its HA peers and directly related CIs whose window overlaps\n[around - hours_before, around + hours_after]. `around` is ISO 8601 UTC, epoch seconds or 'now'.",
+    "input_schema": {
+      "properties": {
+        "device": {
+          "title": "Device",
+          "type": "string"
+        },
+        "around": {
+          "default": "now",
+          "title": "Around",
+          "type": "string"
+        },
+        "hours_before": {
+          "default": 48,
+          "title": "Hours Before",
+          "type": "number"
+        },
+        "hours_after": {
+          "default": 24,
+          "title": "Hours After",
+          "type": "number"
+        }
+      },
+      "required": [
+        "device"
+      ],
+      "type": "object",
+      "title": "find_related_changesArguments"
+    }
+  },
+  {
+    "name": "find_other_authorisations",
+    "description": "For a change session with no in-window CHG: CHGs near the time on its devices, on HA peers, on\nrelated CIs, the engineer's CHGs on other devices, CHGs raised afterwards, CHG numbers in the comment.",
+    "input_schema": {
+      "properties": {
+        "devices": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Devices",
+          "type": "array"
+        },
+        "first_seen": {
+          "title": "First Seen",
+          "type": "string"
+        },
+        "last_seen": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Seen"
+        },
+        "engineer": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Engineer"
+        },
+        "chg_refs": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Chg Refs"
+        }
+      },
+      "required": [
+        "devices",
+        "first_seen"
+      ],
+      "type": "object",
+      "title": "find_other_authorisationsArguments"
+    }
+  },
+  {
+    "name": "find_incidents_downstream",
+    "description": "Incidents opened after `since` on the devices' CIs or on CIs/services up to max_hops downstream,\nranked by score (closer, sooner and higher-priority incidents score higher).",
+    "input_schema": {
+      "properties": {
+        "devices": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Devices",
+          "type": "array"
+        },
+        "since": {
+          "title": "Since",
+          "type": "string"
+        },
+        "hours": {
+          "default": 72,
+          "title": "Hours",
+          "type": "number"
+        },
+        "max_hops": {
+          "default": 2,
+          "title": "Max Hops",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "devices",
+        "since"
+      ],
+      "type": "object",
+      "title": "find_incidents_downstreamArguments"
+    }
+  },
+  {
+    "name": "get_device_neighbourhood",
+    "description": "Everything connected to a device: its CIs, HA peers, upstream and downstream CIs/services,\nchanges (last 30 days, next 7), incidents (last 7 days) and ChangeGuard cases.",
+    "input_schema": {
+      "properties": {
+        "device": {
+          "title": "Device",
+          "type": "string"
+        }
+      },
+      "required": [
+        "device"
+      ],
+      "type": "object",
+      "title": "get_device_neighbourhoodArguments"
+    }
+  },
+  {
+    "name": "run_spl",
+    "description": "Run a read-only SPL search, e.g. `| inputlookup cg_cases_lookup | where platform=\"paloalto\"` or\n`index=changeguard_detect session_device=nspvmp1822da01`. Writing commands and macros are refused.",
+    "input_schema": {
+      "properties": {
+        "query": {
+          "title": "Query",
+          "type": "string"
+        },
+        "earliest": {
+          "default": "-24h",
+          "title": "Earliest",
+          "type": "string"
+        },
+        "latest": {
+          "default": "now",
+          "title": "Latest",
+          "type": "string"
+        },
+        "max_rows": {
+          "default": 200,
+          "title": "Max Rows",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object",
+      "title": "run_splArguments"
+    }
+  }
+]

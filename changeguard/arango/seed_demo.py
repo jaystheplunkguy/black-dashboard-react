@@ -1,132 +1,133 @@
 #!/usr/bin/env python3
-"""Seed the graph with demo data for scenarios 01-04 and 06 (times relative to now).
+"""Seed the ChangeGuard graph with the demo topology (times relative to now).
 
-Pairs with splunk_app/changeguard/lookups/cg_demo_detections.csv, whose event
-offsets line up with the change windows below. Run this, then the
-"CG - Demo - Seed detections" search, then the pipeline (see README).
+Builds the same documents the Splunk loaders would write, from the same CSVs:
+  - cis / devices / device_is  from changeguard_dev_stubs/lookups/itam_ci_seed.csv
+  - changes / chg_affects / implemented_by / people  from changeguard/lookups/cg_demo_changes.csv
+plus what only HELIX relationship/incident tables would provide in production:
+ci_rel, incidents, inc_on, and ha_peer edges for the 01/02 firewall pairs.
 
     python3 arango/seed_demo.py [--reset]
+Then run "CG - Demo - Seed" in Splunk and the pipeline (README).
 """
 
 import argparse
+import csv
 import os
+import re
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "splunk_app", "changeguard", "bin"))
+HERE = os.path.dirname(os.path.abspath(__file__))
+APPS = os.path.join(HERE, "..", "splunk_app")
+sys.path.insert(0, os.path.join(APPS, "changeguard", "bin"))
 
 from bootstrap import EDGES, VERTICES  # noqa: E402
-from changeguard_core.config import client_from_env  # noqa: E402
-from changeguard_core.keys import edge_key  # noqa: E402
+from changeguard_core.keys import edge_key, normalise_host, safe_key  # noqa: E402
 
-H = 3600
+from changeguard_core.config import client_from_env  # noqa: E402
+
+CI_CSV = os.path.join(APPS, "changeguard_dev_stubs", "lookups", "itam_ci_seed.csv")
+CHANGES_CSV = os.path.join(APPS, "changeguard", "lookups", "cg_demo_changes.csv")
+
+SERVICE_RE = re.compile(r"service", re.I)
+NETWORK_RE = re.compile(r"network|firewall|router|switch|load ?balancer", re.I)
+
+
+def _rows(path):
+    with open(path, newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _edge(frm, to, **attrs):
+    doc = {"_from": frm, "_to": to, "_key": edge_key(frm, to)}
+    doc.update(attrs)
+    return doc
+
+
+def _offset(now, value):
+    return now + int(value) if value not in (None, "") else None
+
+
+def ha_peer_name(device):
+    """Naming rule for HA pairs, mirrors the cg_ha_peer macro: ...01 <-> ...02."""
+    if device.endswith("01"):
+        return device[:-2] + "02"
+    if device.endswith("02"):
+        return device[:-2] + "01"
+    return None
+
+
+def topology():
+    cis, devices, device_is = [], [], []
+    for row in _rows(CI_CSV):
+        text = " ".join([row["Category"], row["Type"], row["SystemRole"]])
+        doc = {k: v for k, v in row.items() if v}
+        doc.update({"_key": safe_key(row["CI_Name"]), "is_service": int(bool(SERVICE_RE.search(row["Category"]))),
+                    "is_network": int(bool(NETWORK_RE.search(text)))})
+        cis.append(doc)
+        device = normalise_host(row["CI_Name"])
+        devices.append({"_key": safe_key(device), "device_name": device})
+        device_is.append(_edge("devices/" + safe_key(device), "cis/" + safe_key(row["CI_Name"])))
+    names = {d["_key"] for d in devices}
+    ha = []
+    for name in sorted(names):
+        peer = ha_peer_name(name)
+        if peer in names and name < peer:
+            ha.append(_edge("devices/" + name, "devices/" + peer, a=name, b=peer))
+    return cis, devices, device_is, ha
+
+
+def change_docs(now):
+    changes, affects, implemented, people = {}, [], [], {}
+    for row in _rows(CHANGES_CSV):
+        cid = row["change_id"]
+        changes[cid] = {k: v for k, v in {
+            "_key": safe_key(cid), "change_id": cid, "source": row["source"], "status": row["status"],
+            "approval": row["approval"], "approved": int(row["approved"]), "risk": row["risk"],
+            "chg_type": row["chg_type"], "planned_start": _offset(now, row["start_offset_s"]),
+            "planned_end": _offset(now, row["end_offset_s"]), "created_at": _offset(now, row["created_offset_s"]),
+            "implementer": row["implementer"] or None, "imp_group": row["imp_group"], "summary": row["summary"],
+            "description": row["description"],
+        }.items() if v not in (None, "")}
+        affects.append(_edge("changes/" + safe_key(cid), "devices/" + safe_key(row["device"]), change_id=cid))
+        if row["ci_name"]:
+            affects.append(_edge("changes/" + safe_key(cid), "cis/" + safe_key(row["ci_name"]), change_id=cid))
+        if row["implementer"]:
+            people[row["implementer"]] = {"_key": safe_key(row["implementer"]), "person": row["implementer"]}
+            implemented.append(_edge("changes/" + safe_key(cid), "people/" + safe_key(row["implementer"]),
+                                     change_id=cid))
+    return list(changes.values()), affects, implemented, list(people.values())
 
 
 def build(now):
-    def ci(key, name, ci_class, env="Production"):
-        return {"_key": key, "name": name, "ci_class": ci_class, "environment": env}
+    cis, devices, device_is, ha = topology()
+    changes, affects, implemented, people = change_docs(now)
 
-    devices = [
-        {"_key": "fw-syd-01", "name": "fw-syd-01", "platform": "paloalto"},
-        {"_key": "fw-syd-02", "name": "fw-syd-02", "platform": "paloalto"},
-        {"_key": "fw-mel-01", "name": "fw-mel-01", "platform": "paloalto"},
-        {"_key": "fw-per-01", "name": "fw-per-01", "platform": "paloalto"},
-        {"_key": "rtr-mel-01", "name": "rtr-mel-01", "platform": "cisco_ios"},
-    ]
-    cis = [
-        ci("OI-FW-SYD-01", "fw-syd-01", "Firewall"),
-        ci("OI-FW-SYD-02", "fw-syd-02", "Firewall"),
-        ci("OI-FW-MEL-01", "fw-mel-01", "Firewall"),
-        ci("OI-FW-PER-01", "fw-per-01", "Firewall"),
-        ci("OI-RTR-MEL-01", "rtr-mel-01", "Router"),
-        ci("OI-LB-PER-01", "lb-per-01", "Load Balancer"),
-        ci("OI-APP-WEB-01", "web-portal-app", "Application"),
-    ]
-    services = [
-        {"_key": "SVC-PAYMENTS", "name": "Payments API", "ci_class": "Business Service"},
-        {"_key": "SVC-WEBPORTAL", "name": "Customer Web Portal", "ci_class": "Business Service"},
-    ]
-    people = [
-        {"_key": "jsmith", "name": "John Smith", "team": "Network Security"},
-        {"_key": "akumar", "name": "Asha Kumar", "team": "Network Security"},
-        {"_key": "bwilson", "name": "Ben Wilson", "team": "Network Operations"},
-    ]
-    changes = [
-        {   # 01 legitimate (also authorises the HA-peer session, 02b)
-            "_key": "CRQ000001001", "summary": "Publish WEB-SRV-01 on tcp/443 through fw-syd-01",
-            "description": "Add address object WEB-SRV-01 (10.20.30.40/32) and security rule allow-web-443 "
-                           "from zone DMZ to zone WEB, service tcp/443 only, action allow. Apply to the "
-                           "fw-syd-01/02 HA pair.",
-            "plan": "1. set address WEB-SRV-01 ip-netmask 10.20.30.40/32\n2. add rule allow-web-443 DMZ->WEB "
-                    "service-https allow\n3. commit and validate",
-            "status": "Implementation In Progress", "approval": "Approved", "chg_class": "Normal",
-            "risk": "Low", "implementer": "jsmith",
-            "planned_start": now - 3 * H, "planned_end": now + 1 * H, "created_at": now - 72 * H,
-        },
-        {   # 03 approved but implemented wrongly
-            "_key": "CRQ000001003", "summary": "Allow web-portal access from branch subnet",
-            "description": "Permit tcp/443 from 10.1.1.0/24 (branch users) to 10.50.0.10 (web-portal). "
-                           "No other services or sources.",
-            "plan": "Add rule branch-to-portal: source 10.1.1.0/24, destination 10.50.0.10, "
-                    "service-https, action allow. Commit.",
-            "status": "Implementation In Progress", "approval": "Approved", "chg_class": "Normal",
-            "risk": "Medium", "implementer": "akumar",
-            "planned_start": now - 2 * H, "planned_end": now + 2 * H, "created_at": now - 96 * H,
-        },
-        {   # 04 approved, compliant, then causes an incident downstream
-            "_key": "CRQ000001004", "summary": "Tighten outbound rules on fw-per-01",
-            "description": "Replace the broad outbound rule out-any with out-https (tcp/443 only) as part of "
-                           "the PCI hardening programme.",
-            "plan": "delete rule out-any; add rule out-https service-https allow; commit",
-            "status": "Implementation In Progress", "approval": "Approved", "chg_class": "Normal",
-            "risk": "Medium", "implementer": "jsmith",
-            "planned_start": now - 4 * H, "planned_end": now, "created_at": now - 120 * H,
-        },
-        {   # 06 proposed change to score
-            "_key": "CRQ000001006", "summary": "Upgrade PAN-OS on fw-per-01",
-            "description": "Upgrade fw-per-01 from 10.2 to 11.1 during the weekend window.",
-            "plan": "Download, install, reboot, validate.", "status": "Scheduled",
-            "approval": "Approved", "chg_class": "Normal", "risk": "High", "implementer": "jsmith",
-            "planned_start": now + 72 * H, "planned_end": now + 76 * H, "created_at": now - 24 * H,
-        },
-    ]
-    incidents = [
-        {   # 04: P2 on the payments service 25 min ago (~25 min after the fw-per-01 change)
-            "_key": "INC000009004", "summary": "Payments API timeouts calling card processor",
-            "priority": 2, "status": "In Progress", "opened_at": now - 1500, "service": "Payments API",
-        },
-    ]
+    def ci(name):
+        return "cis/" + safe_key(name)
 
-    def edge(frm, to, **attrs):
-        doc = {"_from": frm, "_to": to, "_key": edge_key(frm, to)}
-        doc.update(attrs)
-        return doc
-
-    edges = {
-        "device_is": [edge("devices/%s" % d["_key"], "cis/OI-%s" % d["_key"].upper()) for d in devices],
-        "ha_peer": [edge("devices/fw-syd-01", "devices/fw-syd-02")],
-        "ci_rel": [
-            edge("cis/OI-FW-PER-01", "cis/OI-LB-PER-01", rel_type="routes to"),
-            edge("cis/OI-LB-PER-01", "services/SVC-PAYMENTS", rel_type="supports"),
-            edge("cis/OI-FW-MEL-01", "cis/OI-APP-WEB-01", rel_type="protects"),
-            edge("cis/OI-APP-WEB-01", "services/SVC-WEBPORTAL", rel_type="supports"),
-        ],
-        "chg_affects": [
-            edge("changes/CRQ000001001", "cis/OI-FW-SYD-01"),
-            edge("changes/CRQ000001003", "cis/OI-FW-MEL-01"),
-            edge("changes/CRQ000001004", "cis/OI-FW-PER-01"),
-            edge("changes/CRQ000001006", "cis/OI-FW-PER-01"),
-        ],
-        "implemented_by": [edge("changes/%s" % c["_key"], "people/%s" % c["implementer"]) for c in changes],
-        "inc_on": [edge("incidents/INC000009004", "services/SVC-PAYMENTS")],
-    }
-    vertices = {"devices": devices, "cis": cis, "services": services, "people": people,
-                "changes": changes, "incidents": incidents}
+    ci_rel = [
+        _edge(ci("nspnfp7perb01.nsp.com.au"), ci("lb-per-01.nsp.com.au"), rel_type="Dependency"),
+        _edge(ci("nspnfp7perb02.nsp.com.au"), ci("lb-per-01.nsp.com.au"), rel_type="Dependency"),
+        _edge(ci("lb-per-01.nsp.com.au"), ci("Payments API"), rel_type="Dependency"),
+        _edge(ci("nspvfp1822da01.nsp.com.au"), ci("web-portal-app.nsp.com.au"), rel_type="Dependency"),
+        _edge(ci("web-portal-app.nsp.com.au"), ci("Customer Web Portal"), rel_type="Dependency"),
+    ]
+    incidents = [{
+        # Scenario 04: P2 on Payments API ~25 min after the DG-7PERB push (demo session ends ~3400 s ago).
+        "_key": "INC000009004", "summary": "Payments API timeouts calling card processor", "priority": 2,
+        "status": "In Progress", "opened_at": now - 1900, "inc_ci": "Payments API",
+    }]
+    inc_on = [_edge("incidents/INC000009004", ci("Payments API"))]
+    vertices = {"cis": cis, "devices": devices, "changes": changes, "people": people, "incidents": incidents}
+    edges = {"device_is": device_is, "ha_peer": ha, "ci_rel": ci_rel, "chg_affects": affects,
+             "implemented_by": implemented, "inc_on": inc_on}
     return vertices, edges
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--reset", action="store_true", help="empty every ChangeGuard collection first")
     args = parser.parse_args()
     client = client_from_env()
