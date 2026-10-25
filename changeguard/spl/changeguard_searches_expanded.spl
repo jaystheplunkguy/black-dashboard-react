@@ -1,0 +1,854 @@
+```
+  ChangeGuard AI - scheduled searches in SPL (macros expanded: needs only the KV stores, lookups and the Arango commands).
+  Generated from splunk_app/changeguard/default/savedsearches.conf by tools/export_spl.py.
+  Each block is one saved search; paste a block into the search bar (or savedsearches.conf).
+```
+
+
+```
+  Saved search : CG - CI - Refresh itam_ci_lookup
+  Schedule     : 5 */4 * * *
+  Time range   : earliest=-25h@h latest=now
+                 max_concurrent = 1
+
+  Fixed itam_ci_lookup refresh. Replaces the existing one (disable that): upserts EVERY CI by _key=CI_Name
+  instead of only new ones (the old 'where isnull(lookupCI)' meant existing CIs were never updated) and keeps
+  _key in the output. CI uses cg_norm_host, so IP-named CIs keep the whole address.
+```
+index="itam-ci-database-app-s" sourcetype="itam-ci-extract"
+| eval CI_Name=trim(coalesce('Child Name', Child_Name))
+| where isnotnull(CI_Name) AND CI_Name!=""
+| stats latest(Category) AS Category latest(Description) AS Description latest(EnvironmentType) AS EnvironmentType
+    latest(Floor) AS Floor latest(IMRBuilding) AS IMRBuilding latest(InstanceId) AS InstanceId latest(Item) AS Item
+    latest(ManufacturerName) AS ManufacturerName latest(Model) AS Model latest(Name) AS Name latest(Region) AS Region
+    latest(Room) AS Room latest(SerialNumber) AS SerialNumber latest(Site) AS Site latest(SystemRole) AS SystemRole
+    latest(VersionNumber) AS VersionNumber latest(Type) AS Type BY CI_Name
+| eval CI=if(match(trim(CI_Name), "^\d{1,3}(\.\d{1,3}){3}$"), trim(CI_Name), lower(trim(mvindex(split(trim(CI_Name), "."), 0)))), _key=CI_Name
+| table _key CI CI_Name Category Description EnvironmentType Floor IMRBuilding InstanceId Item ManufacturerName Model Name Region Room SerialNumber Site SystemRole VersionNumber Type
+| outputlookup itam_ci_lookup append=true key_field=_key
+
+
+```
+  Saved search : CG - Changes - CALM feed
+  Schedule     : */10 * * * *
+  Time range   : earliest=-12m@m latest=-2m@m
+                 max_concurrent = 1
+
+  CALM -> cg_changes (one row per CALM_ID + device). Fixes vs the old changes.csv feed: latest() instead of
+  values() so an updated change has ONE start/end; devices are normalised with cg_norm_host instead of the ITSI
+  entity lookup; KV upsert by _key instead of an ever-growing CSV (cleanup keeps 120 days).
+  [ASSUMED] SUMMARY, DESCRIPTION, CHG_IMP_GROUP, IMPLEMENTER exist in cmart-db-app-n (null if not).
+```
+index="cmart-db-app-n" REQUEST_STATE="*RT*"
+| rex field=NODE_IDENTIFIER "^(\W+|)(?P<ASSET>\S+)"
+| eval device=if(match(trim(ASSET), "^\d{1,3}(\.\d{1,3}){3}$"), trim(ASSET), lower(trim(mvindex(split(trim(ASSET), "."), 0))))
+| where isnotnull(device) AND device!="" AND device!="null"
+| stats latest(REQUEST_STATE) AS status latest(RISK_LEVEL) AS risk latest(CE_START) AS ce_start latest(CE_END) AS ce_end
+    latest(TECHNOLOGY) AS chg_type latest(SUMMARY) AS summary latest(DESCRIPTION) AS description
+    latest(CHG_IMP_GROUP) AS imp_group latest(IMPLEMENTER) AS implementer BY CALM_ID device
+| eval change_id=CALM_ID, source="CALM", start=if(match(ce_start, "^\d+(\.\d+)?$"), tonumber(ce_start), round(coalesce(strptime(ce_start, "%Y-%m-%d %H:%M:%S.%N"), strptime(ce_start, "%Y-%m-%d %H:%M:%S"), strptime(ce_start, "%m/%d/%Y %H:%M:%S")), 0)), end=if(match(ce_end, "^\d+(\.\d+)?$"), tonumber(ce_end), round(coalesce(strptime(ce_end, "%Y-%m-%d %H:%M:%S.%N"), strptime(ce_end, "%Y-%m-%d %H:%M:%S"), strptime(ce_end, "%m/%d/%Y %H:%M:%S")), 0)),
+    approved=if(match(upper(coalesce(status, "")), "RT"), 1, 0), approval=if(approved=1, "Approved", "Pending"),
+    risk=mvindex(split(risk, "/"), 0), implementer=lower(implementer), updated_at=now(), _key=change_id."|".device
+| lookup itam_ci_lookup CI AS device OUTPUT CI_Name AS ci_name Name AS ci_product Category AS ci_category
+    | eval ci_name=mvindex(ci_name, 0), ci_product=mvindex(ci_product, 0), ci_category=mvindex(ci_category, 0)
+| table _key change_id source device ci_name status approval approved risk chg_type start end implementer imp_group summary description updated_at
+| outputlookup cg_changes_lookup append=true key_field=_key
+
+
+```
+  Saved search : CG - Changes - HELIX CRQ feed
+  Schedule     : 3-59/10 * * * *
+  Time range   : earliest=-120d@d latest=now
+                 max_concurrent = 1
+
+  HELIX CRQ -> cg_changes (one row per CRQ + associated CI). Replaces the CRQ exclusion in the old feed.
+  The subsearch finds CRQs touched in the last window in ANY of the three tables (one row: a "search" field
+  with more than one row only keeps the first); the outer search then
+  rebuilds those CRQs from all three tables over 120 days, so rows that arrive at different times still join.
+  [ASSUMED] HELIX column names in the eval below.
+```
+(index="itam-reporting-database-app-n" source="*Change_Information*") OR (index="itam-reporting-database-app-n" source="*Change_Approvals*") OR (index="itam-reporting-database-app-n" source="*Change_CI_Assoc*")
+    [search (index="itam-reporting-database-app-n" source="*Change_Information*") OR (index="itam-reporting-database-app-n" source="*Change_Approvals*") OR (index="itam-reporting-database-app-n" source="*Change_CI_Assoc*") earliest=-12m@m latest=-2m@m
+     | eval chg_id=upper(coalesce(Infrastructure_Change_ID, Change_ID, Request_ID01))
+     | where isnotnull(chg_id)
+     | stats values(chg_id) AS ids
+     | eval search="(\"".mvjoin(mvindex(ids, 0, 4999), "\" OR \"")."\")"
+     | fields search]
+| eval tbl=case(like(source, "%Change_Information%"), "info", like(source, "%Change_Approvals%"), "approval", like(source, "%Change_CI_Assoc%"), "ci", true(), "other"), change_id=upper(coalesce(Infrastructure_Change_ID, Change_ID, Request_ID01))
+| eval summary=if(tbl="info", coalesce(Description, Summary), null()),
+    description=if(tbl="info", coalesce(Detailed_Description, Change_Description), null()),
+    plan=if(tbl="info", coalesce(Implementation_Plan, Change_Plan), null()),
+    status=if(tbl="info", coalesce(Change_Request_Status, Status), null()),
+    chg_type=if(tbl="info", coalesce(Change_Timing, Class), null()),
+    risk=if(tbl="info", coalesce(Risk_Level, Risk), null()),
+    implementer=if(tbl="info", lower(coalesce(ASLOGID, Assignee_Login_ID, Implementer_Login_ID)), null()),
+    imp_group=if(tbl="info", coalesce(ASGRP, Assigned_Group, Support_Group_Name), null()),
+    start=if(tbl="info", if(match(coalesce(Scheduled_Start_Date, Planned_Start_Date), "^\d+(\.\d+)?$"), tonumber(coalesce(Scheduled_Start_Date, Planned_Start_Date)), round(coalesce(strptime(coalesce(Scheduled_Start_Date, Planned_Start_Date), "%Y-%m-%d %H:%M:%S.%N"), strptime(coalesce(Scheduled_Start_Date, Planned_Start_Date), "%Y-%m-%d %H:%M:%S"), strptime(coalesce(Scheduled_Start_Date, Planned_Start_Date), "%m/%d/%Y %H:%M:%S")), 0)), null()),
+    end=if(tbl="info", if(match(coalesce(Scheduled_End_Date, Planned_End_Date), "^\d+(\.\d+)?$"), tonumber(coalesce(Scheduled_End_Date, Planned_End_Date)), round(coalesce(strptime(coalesce(Scheduled_End_Date, Planned_End_Date), "%Y-%m-%d %H:%M:%S.%N"), strptime(coalesce(Scheduled_End_Date, Planned_End_Date), "%Y-%m-%d %H:%M:%S"), strptime(coalesce(Scheduled_End_Date, Planned_End_Date), "%m/%d/%Y %H:%M:%S")), 0)), null()),
+    actual_start=if(tbl="info", if(match(Actual_Start_Date, "^\d+(\.\d+)?$"), tonumber(Actual_Start_Date), round(coalesce(strptime(Actual_Start_Date, "%Y-%m-%d %H:%M:%S.%N"), strptime(Actual_Start_Date, "%Y-%m-%d %H:%M:%S"), strptime(Actual_Start_Date, "%m/%d/%Y %H:%M:%S")), 0)), null()),
+    actual_end=if(tbl="info", if(match(Actual_End_Date, "^\d+(\.\d+)?$"), tonumber(Actual_End_Date), round(coalesce(strptime(Actual_End_Date, "%Y-%m-%d %H:%M:%S.%N"), strptime(Actual_End_Date, "%Y-%m-%d %H:%M:%S"), strptime(Actual_End_Date, "%m/%d/%Y %H:%M:%S")), 0)), null()),
+    created_at=if(tbl="info", if(match(Submit_Date, "^\d+(\.\d+)?$"), tonumber(Submit_Date), round(coalesce(strptime(Submit_Date, "%Y-%m-%d %H:%M:%S.%N"), strptime(Submit_Date, "%Y-%m-%d %H:%M:%S"), strptime(Submit_Date, "%m/%d/%Y %H:%M:%S")), 0)), null()),
+    approval_status=if(tbl="approval", coalesce(Approval_Status, Status), null()),
+    assoc_ci=if(tbl="ci", trim(coalesce(CI_Name, 'CI Name', Request_Description02, CI_ReconID, Request_ID02)), null())
+| stats latest(summary) AS summary latest(description) AS description latest(plan) AS plan latest(status) AS status
+    latest(chg_type) AS chg_type latest(risk) AS risk latest(implementer) AS implementer latest(imp_group) AS imp_group
+    latest(start) AS start latest(end) AS end latest(actual_start) AS actual_start latest(actual_end) AS actual_end
+    latest(created_at) AS created_at latest(approval_status) AS approval_status values(assoc_ci) AS assoc_ci BY change_id
+| where isnotnull(assoc_ci)
+| mvexpand assoc_ci
+| eval assoc_short=if(match(trim(assoc_ci), "^\d{1,3}(\.\d{1,3}){3}$"), trim(assoc_ci), lower(trim(mvindex(split(trim(assoc_ci), "."), 0))))
+| lookup itam_ci_lookup CI_Name AS assoc_ci OUTPUT CI AS dev_by_name
+| lookup itam_ci_lookup InstanceId AS assoc_ci OUTPUT CI AS dev_by_id CI_Name AS name_by_id
+| eval device=coalesce(mvindex(dev_by_name, 0), mvindex(dev_by_id, 0), assoc_short),
+    ci_name=coalesce(if(isnotnull(dev_by_name), assoc_ci, null()), mvindex(name_by_id, 0)),
+    approval=case(lower(approval_status)="approved", "Approved", match(lower(coalesce(approval_status, "")), "reject"), "Rejected", isnotnull(approval_status), "Pending", true(), null()),
+    approved=if(lower(coalesce(approval, ""))="approved" OR (isnull(approval) AND match(lower(coalesce(status, "")), "scheduled|implementation in progress|completed")), 1, 0), approval=coalesce(approval, if(approved=1, "Approved", "Pending")),
+    source="HELIX", updated_at=now(), _key=change_id."|".device
+| table _key change_id source device ci_name status approval approved risk chg_type start end actual_start actual_end created_at implementer imp_group summary description plan updated_at
+| outputlookup cg_changes_lookup append=true key_field=_key
+
+
+```
+  Saved search : CG - Changes - Cleanup 120 days
+  Schedule     : 17 3 * * *
+  Time range   : earliest=-1m latest=now
+                 max_concurrent = 1
+
+  Daily: keep only changes that ended (or started, or were updated) in the last 120 days.
+  outputlookup WITHOUT append/key_field replaces the collection (rows keep their _key); with key_field it would
+  only upsert and nothing would be deleted. Runs at a quiet time between feed runs.
+```
+| inputlookup cg_changes_lookup
+| where coalesce(end, start, updated_at, now())>=relative_time(now(), "-120d")
+| outputlookup cg_changes_lookup
+
+
+```
+  Saved search : CG - Detect - NPT config changes
+  Schedule     : */5 * * * *
+  Time range   : earliest=-10m@m latest=-5m@m
+                 realtime_schedule = 0 (missed windows are replayed)
+                 max_concurrent = 1
+
+  All three NPT triggers -> ONE schema in changeguard_detect (append-only audit evidence).
+  Windows are contiguous (-10m@m..-5m@m every 5 min) and realtime_schedule=0 replays missed windows.
+  Palo Alto: parsed from the PAN-OS CONFIG CSV (works without the TA), TA fields win when present.
+  device = the PAN-OS device_name (the syslog host can be a log collector). Panorama edits and the
+  commit-all pushes the firewalls log share one session_device (cg_detect_enrich).
+  User extraction: one field per pattern, then coalesce, so a later rex cannot overwrite an earlier match.
+```
+(index=network-services-pop-pan-net-s sourcetype="pan:config") OR (index=network-services-pop-net-s ("%SYS-5-CONFIG_I" OR "%PARSER-5-CFGLOG_LOGGEDCMD")) OR (index=secops-nspfirewalls-net ("mojo_server.pl" OR "sfdccsm" OR "ActionQueueScrape.pl"))
+| eval platform=case(sourcetype="pan:config", "paloalto", match(_raw, "%SYS-5-CONFIG_I|%PARSER-5-CFGLOG_LOGGEDCMD"), "cisco_ios", true(), "cisco_ftd")
+| where platform!="cisco_ftd" OR match(_raw, "[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+")
+| rex field=_raw ",CONFIG,[^,]*,[^,]*,(?<pan_gen_time>[^,]*),(?<pan_client_ip>[^,]*),[^,]*,(?<pan_cmd>[^,]*),(?<pan_admin>[^,]*),(?<pan_client>[^,]*),(?<pan_result>[^,]*),(?<pan_path>\"[^\"]*\"|[^,]*),(?:(?<pan_before>\"[^\"]*\"|[^,]*),(?<pan_after>\"[^\"]*\"|[^,]*),)?(?<pan_seq>\d{6,}),(?<pan_flags>0x[0-9a-fA-F]+),[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,(?<pan_device_name>[^,]*),[^,]*,(?<pan_comment>\"[^\"]*\"|[^,]*)"
+| rex field=_raw "Configured from (?<ios_method>\S+) by (?<ios_user>[^\s(]+)(?: on (?<ios_line>\S+))?(?: \((?<ios_src>[^)]+)\))?"
+| rex field=_raw "User:(?<ioscmd_user>\S+)\s+logged command:(?<ios_cmd>.+)$"
+| rex field=_raw "(?<ftd_user>[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)(?:@(?<ftd_src>\d{1,3}(?:\.\d{1,3}){3}))?"
+| rex field=_raw "(?:mojo_server\.pl|sfdccsm|ActionQueueScrape\.pl)[^:]*:\s*(?<ftd_msg>.+)$"
+| eval device=case(platform="paloalto", coalesce(device_name, dvc_name, pan_device_name, host), true(), host),
+    user=case(platform="paloalto", coalesce(admin, pan_admin), platform="cisco_ios", coalesce(ioscmd_user, ios_user), true(), ftd_user),
+    user=if(match(lower(user), "^(vty|con|console|tty|aux)\d*$"), "unknown", user),
+    cmd=case(platform="paloalto", coalesce(cmd, pan_cmd), platform="cisco_ios" AND isnotnull(ios_cmd), "cli", platform="cisco_ios", "config", true(), "audit"),
+    path=if(platform="paloalto", trim(coalesce(path, configuration_path, pan_path), "\""), null()),
+    comment=if(platform="paloalto", trim(coalesce(comment, audit_comment, pan_comment), "\""), null()),
+    src=case(platform="paloalto", coalesce(client_ip, pan_client_ip), platform="cisco_ios", ios_src, true(), ftd_src),
+    result=if(platform="paloalto", coalesce(result, pan_result), null()),
+    msg=case(platform="cisco_ios" AND isnotnull(ios_cmd), "cmd: ".ios_cmd,
+             platform="cisco_ios", "configured from ".coalesce(ios_method, "?").coalesce(" on ".ios_line, ""),
+             platform="cisco_ftd", substr(coalesce(ftd_msg, _raw), 1, 500), true(), null()),
+    event_id=md5(_raw)
+| eval device=if(match(trim(device), "^\d{1,3}(\.\d{1,3}){3}$"), trim(device), lower(trim(mvindex(split(trim(device), "."), 0)))), user=lower(trim(user))
+    | eval device_role=case(platform!="paloalto", platform, match(device, "^nspvmp"), "panorama", true(), "firewall"),
+        event_kind=case(platform="paloalto" AND cmd="commit-all", "push",
+                        platform="paloalto" AND match(cmd, "^commit"), "commit",
+                        platform="paloalto", "edit",
+                        platform="cisco_ios" AND cmd="cli", "edit", true(), "notice")
+    | lookup cg_panorama_members firewall AS device OUTPUT panorama AS member_of
+    | eval session_device=if(event_kind="push" AND device_role="firewall", coalesce(member_of, "nspvmp1822da01"), device),
+        detail=trim(if(platform="paloalto", coalesce(cmd, "")." ".coalesce(path, ""), coalesce(msg, cmd, "")).if(len(comment)>0, " [comment: ".comment."]", "")),
+        detail_kind=case(platform="paloalto" AND event_kind="edit" AND len(path)>0, "config_path",
+                         platform="cisco_ios" AND cmd="cli", "command", true(), "notice")
+    | rex field=detail max_match=5 "(?i)(?<chg_ref>\b(?:CRQ\d{6,12}|CHG\d{5,12}|CALM[-_]?\d{3,12})\b)"
+    | eval chg_refs=mvjoin(mvdedup(mvmap(chg_ref, upper(chg_ref))), " ")
+    | eval user_short=replace(user, "@.*$", "")
+    | lookup roboID.csv user AS user_short OUTPUTNEW description AS robo_description
+    | lookup global_address_lookup uid AS user_short OUTPUTNEW firstName surname title AS user_title
+    | eval is_automation=if(isnotnull(robo_description), 1, 0),
+        user_display=coalesce(robo_description, if(isnotnull(surname), surname.", ".firstName, null()), user)
+    | fields - firstName surname robo_description
+    | lookup itam_ci_lookup CI AS device OUTPUT CI_Name AS ci_name Name AS ci_product Category AS ci_category
+    | eval ci_name=mvindex(ci_name, 0), ci_product=mvindex(ci_product, 0), ci_category=mvindex(ci_category, 0)
+    | table _time event_id platform device device_role session_device event_kind user user_display user_title is_automation src cmd path comment result detail detail_kind chg_refs ci_name ci_product ci_category
+| collect index=changeguard_detect source="changeguard:detect"
+
+
+```
+  Saved search : CG - Correlate - Sessions to cases
+  Schedule     : 2-59/5 * * * *
+  Time range   : earliest=-4h@m latest=now
+                 max_concurrent = 1
+
+  Session + correlation -> cg_cases (INSERT ONLY: existing case ids are skipped, so AI/watcher verdicts are
+  never overwritten). Session = session_device + user with a 30 min gap; a Panorama session includes the
+  commit-all pushes and its targets. Devices of interest = session device + targets + HA peers.
+  Candidate changes come from cg_changes on those devices, plus CHGs referenced in the commit comment.
+  Score: ref in comment (8) > in window (4) > approved (2) > implementer (1); the best wins, every candidate
+  in the -48h/+1d related window is kept in related_changes. Devices with no CI become UNKNOWN_CI cases.
+  Looks back 4h so a session's start is visible; a session is processed once it has been quiet for 30 min.
+```
+index=changeguard_detect
+| dedup event_id
+| fillnull value="unknown" user
+| sort 0 session_device user _time
+| streamstats current=f last(_time) AS prev_time BY session_device user
+| eval new_session=if(isnull(prev_time) OR _time-prev_time>1800, 1, 0)
+| streamstats sum(new_session) AS session_seq BY session_device user
+| eval target=if(event_kind="push" AND device!=session_device, device, null()),
+    line=strftime(_time, "%H:%M:%S")." ".device." ".coalesce(detail, cmd, ""),
+    detail_flag=if(detail_kind="config_path" OR detail_kind="command", 1, 0)
+| stats min(_time) AS first_seen max(_time) AS last_seen count AS event_count values(platform) AS platform
+    values(device_role) AS device_role values(target) AS targets values(cmd) AS cmds values(src) AS src
+    list(line) AS lines values(chg_refs) AS chg_ref_text values(comment) AS comments max(detail_flag) AS has_detail
+    max(is_automation) AS is_automation first(user_display) AS user_display first(user_title) AS user_title
+    BY session_device user session_seq
+| where last_seen<=now()-1800 AND last_seen>now()-1800-3600
+| eval case_id=substr(md5(session_device."|".user."|".first_seen), 1, 16)
+| lookup cg_cases_lookup _key AS case_id OUTPUT status AS existing_status
+| where isnull(existing_status)
+| eval platform=mvindex(platform, 0), device_role=if(isnotnull(mvfind(device_role, "panorama")), "panorama", mvindex(device_role, 0)),
+    truncated=if(first_seen<relative_time(now(), "-4h@m")+1800, 1, 0),
+    itam_user=lower(replace(user, "@.*$", "")),
+    peer_names=mvappend(case(match(session_device, "01$"), replace(session_device, "01$", "02"), match(session_device, "02$"), replace(session_device, "02$", "01"), true(), null()), mvmap(targets, case(match(targets, "01$"), replace(targets, "01$", "02"), match(targets, "02$"), replace(targets, "02$", "01"), true(), null())))
+| lookup itam_ci_lookup CI AS peer_names OUTPUT CI AS known_peers
+| lookup cg_ha_pairs device_a AS session_device OUTPUT device_b AS pair_b1
+| lookup cg_ha_pairs device_b AS session_device OUTPUT device_a AS pair_a1
+| lookup cg_ha_pairs device_a AS targets OUTPUT device_b AS pair_b2
+| lookup cg_ha_pairs device_b AS targets OUTPUT device_a AS pair_a2
+| eval doi=mvdedup(mvappend(session_device, targets, known_peers, pair_a1, pair_b1, pair_a2, pair_b2))
+| lookup itam_ci_lookup CI AS doi OUTPUT CI_Name AS ci_names
+| rex field=chg_ref_text max_match=10 "(?i)(?<chg_ref>\b(?:CRQ\d{6,12}|CHG\d{5,12}|CALM[-_]?\d{3,12})\b)"
+| eval chg_refs=mvdedup(mvmap(chg_ref, upper(chg_ref)))
+| eval nl=urldecode("%0A")
+| eval change_log=substr(mvjoin(lines, nl), 1, 6000), comments=mvjoin(comments, " | ")
+| lookup cg_changes_lookup device AS doi OUTPUT _key AS dev_change_keys
+| lookup cg_changes_lookup change_id AS chg_refs OUTPUT _key AS ref_change_keys
+| eval change_key=mvdedup(mvappend(dev_change_keys, ref_change_keys))
+| fillnull value="none" change_key
+| mvexpand change_key
+| lookup cg_changes_lookup _key AS change_key OUTPUT change_id AS c_id source AS c_source device AS c_device
+    status AS c_status approval AS c_approval approved AS c_approved start AS c_start end AS c_end
+    implementer AS c_implementer imp_group AS c_imp_group summary AS c_summary
+| eval c_end=coalesce(c_end, c_start),
+    c_is_ref=if(isnotnull(c_id) AND isnotnull(mvfind(chg_refs, "^".c_id."$")), 1, 0),
+    c_in_window=if(isnotnull(c_start) AND first_seen>=c_start-1800 AND last_seen<=c_end+1800, 1, 0),
+    c_related=if(isnotnull(c_start) AND c_start>=first_seen-172800 AND c_end<=last_seen+86400 AND first_seen<=c_end+3600, 1, 0),
+    c_user_ok=case(isnull(c_id) OR isnull(c_implementer) OR c_implementer="", null(), lower(c_implementer)=itam_user, 1, true(), 0),
+    c_via=case(isnull(c_device), null(), c_device=session_device, "self", isnotnull(mvfind(targets, "^".c_device."$")), "target", true(), "ha_peer"),
+    c_candidate=if(isnotnull(c_id) AND (c_is_ref=1 OR c_in_window=1 OR c_related=1), 1, 0),
+    c_score=if(c_candidate=1, c_is_ref*8 + c_in_window*4 + coalesce(c_approved, 0)*2 + coalesce(c_user_ok, 0)*1, -1),
+    rel_id=if(c_candidate=1, c_id, null()),
+    proximity=if(c_candidate=1, abs(c_start-first_seen), 9999999999)
+| eventstats values(rel_id) AS related_changes dc(rel_id) AS candidate_count BY case_id
+| sort 0 case_id -c_score proximity
+| dedup case_id
+| eval authorising=if(c_candidate=1 AND (c_in_window=1 OR c_is_ref=1), 1, 0),
+    chg_number=if(authorising=1, c_id, null()), chg_key=if(authorising=1, change_key, null()),
+    chg_source=if(authorising=1, c_source, null()), chg_device=if(authorising=1, c_device, null()),
+    match_via=if(authorising=1, c_via, null()), chg_summary=if(authorising=1, c_summary, null()),
+    chg_status=if(authorising=1, c_status, null()), chg_approval=if(authorising=1, c_approval, null()),
+    chg_implementer=if(authorising=1, c_implementer, null()), chg_imp_group=if(authorising=1, c_imp_group, null()),
+    planned_start=if(authorising=1, c_start, null()), planned_end=if(authorising=1, c_end, null()),
+    is_ref=if(authorising=1, c_is_ref, 0), in_window=if(authorising=1, c_in_window, null()),
+    approved=if(authorising=1, c_approved, null()), user_ok=if(authorising=1, c_user_ok, null()),
+    match_score=if(authorising=1, c_score, null())
+| eval verdict=case(
+    authorising=0 AND isnull(ci_names) AND candidate_count=0, "UNKNOWN_CI",
+    authorising=0, "UNPLANNED_CANDIDATE",
+    in_window=0, "OUT_OF_WINDOW",
+    approved!=1, "UNAPPROVED",
+    user_ok=0, "WRONG_IMPLEMENTER",
+    has_detail=1, "PENDING_INTENT_CHECK",
+    true(), "COMPLIANT_WATCH")
+| eval via_text=case(match_via="target", " (raised on push target ".chg_device.")", match_via="ha_peer", " (raised on HA peer ".chg_device.")", true(), ""),
+    reasons=case(
+    verdict="UNKNOWN_CI", "None of ".mvjoin(doi, ", ")." is in itam_ci_lookup and no change record names them",
+    verdict="UNPLANNED_CANDIDATE", "No CHG covers this session on ".mvjoin(doi, ", ").if(candidate_count>0, "; related changes nearby: ".mvjoin(related_changes, ", "), ""),
+    verdict="OUT_OF_WINDOW", chg_number." is referenced but its window ".strftime(planned_start, "%F %T")."-".strftime(planned_end, "%F %T")." does not cover ".strftime(first_seen, "%F %T")."-".strftime(last_seen, "%T"),
+    verdict="UNAPPROVED", chg_number.via_text." is not approved (approval ".coalesce(chg_approval, "none").", status ".coalesce(chg_status, "?").")",
+    verdict="WRONG_IMPLEMENTER", "Done by ".user." but ".chg_number.via_text." is assigned to ".coalesce(chg_implementer, "?"),
+    true(), chg_number.via_text." approved".if(is_ref=1, ", referenced in the commit comment", "").", in window".case(user_ok=1, ", implementer matches", isnull(user_ok), ", implementer not recorded (group ".coalesce(chg_imp_group, "?").")", true(), "").if(verdict="COMPLIANT_WATCH", "; config detail not logged, so intent cannot be checked", ""))
+| eval status=case(verdict="UNKNOWN_CI", "review", verdict="UNPLANNED_CANDIDATE", "investigate",
+        verdict="PENDING_INTENT_CHECK", "intent_check", verdict="COMPLIANT_WATCH", "watch", true(), "alert"),
+    severity=case(verdict="UNAPPROVED", "high", status="alert", "medium", true(), "info"),
+    confidence=if(status="alert" OR status="watch", 1, null()),
+    watch_until=if(status="watch", last_seen+259200, null()),
+    ai_attempts=0, created_at=now(), updated_at=now(), _key=case_id
+| table _key case_id session_device platform device_role targets doi ci_names user user_display user_title itam_user is_automation src first_seen last_seen event_count cmds change_log has_detail chg_refs comments truncated status verdict severity created_at updated_at chg_number chg_key chg_source chg_device match_via chg_summary chg_status chg_approval chg_implementer chg_imp_group planned_start planned_end is_ref in_window approved user_ok match_score related_changes candidate_count reasons confidence watch_until ai_attempts
+| outputlookup cg_cases_lookup append=true key_field=_key
+| cgarango collection=cases key=case_id on_error=mark multivalue="targets,doi,related_changes,reasons,deviations,evidence_refs"
+    fields="case_id,session_device,platform,device_role,targets,doi,user,user_display,itam_user,is_automation,first_seen,last_seen,event_count,status,verdict,severity,chg_number,chg_source,match_via,chg_summary,related_changes,reasons,confidence,deviations,evidence_refs,watch_until,followup_case,rollback_case,impact_score,impact_incident,evidence_summary,alerted_at,updated_at"
+| eval from=if(isnotnull(chg_number), "cases/".case_id, null()), to="changes/".chg_number, reason="best match (score ".match_score.", via ".match_via.")"
+| cgarango collection=case_matched from=from to=to fields="reason" on_error=mark
+| eval on_dev=mvappend(session_device, targets)
+| mvexpand on_dev
+| eval role=if(on_dev=session_device, "session", "target"), from="cases/".case_id, to="devices/".on_dev
+| cgarango collection=case_on from=from to=to fields="role" on_error=mark
+
+
+```
+  Saved search : CG - AI - Intent check
+  Schedule     : */5 * * * *
+  Time range   : earliest=-1m latest=now
+                 max_concurrent = 1
+
+  Scenario 03: does what was changed match the approved CHG? Owns status=intent_check.
+  JSON back: verdict match|partial|deviation, confidence, reasons[], deviations[], evidence_refs[].
+  -> watch COMPLIANT_WATCH | alert IMPLEMENTATION_DEVIATION | review (low confidence, or 3 failed LLM calls)
+```
+| inputlookup cg_cases_lookup where status="intent_check"
+| lookup cg_changes_lookup _key AS chg_key OUTPUT summary AS c_summary description AS c_description plan AS c_plan
+| eval nl=urldecode("%0A")
+| eval cg_prompt="You are ChangeGuard, a network change-assurance analyst. Decide whether the configuration changes in this session implement the APPROVED change and nothing more.".nl.
+    "The logs show WHICH objects were changed (Palo Alto config xpath, IOS command) and the command (set/edit/delete/move/rename), not the new values. Judge by the objects, rules, device groups and actions named.".nl.
+    "Flag: objects or rules the change does not mention; deletes or moves it does not describe; different device groups or devices; broad objects such as 'any' or 'temp' rules.".nl.
+    "Reply with ONLY one JSON object, no markdown: {\"verdict\":\"match|partial|deviation\",\"confidence\":0.0-1.0,\"reasons\":[\"...\"],\"deviations\":[\"...\"],\"evidence_refs\":[\"log line time or CHG field\"]}".nl.nl.
+    "APPROVED CHANGE ".chg_number." (".chg_source.", on ".chg_device.")".nl."Summary: ".coalesce(c_summary, chg_summary, "").nl."Description: ".coalesce(c_description, "").nl."Implementation plan: ".coalesce(c_plan, "").nl.nl.
+    "SESSION on ".session_device." (".device_role.")".if(mvcount(targets)>0, ", pushed to ".mvjoin(targets, ", "), "")." by ".user." (".coalesce(user_display, "").") ".strftime(first_seen, "%F %T")." to ".strftime(last_seen, "%F %T").nl.
+    "COMMIT COMMENTS: ".coalesce(comments, "none").nl."CHANGES (".event_count." events):".nl.change_log
+| ai prompt="{cg_prompt}"
+    | eval llm_raw=coalesce(ai_result_1, ai_result, response, result)
+| rex field=llm_raw "(?s)(?<llm_json>\{.*\})"
+    | spath input=llm_json path=verdict output=llm_verdict
+    | spath input=llm_json path=confidence output=llm_confidence
+    | spath input=llm_json path=reasons{} output=llm_reasons
+    | spath input=llm_json path=evidence_refs{} output=llm_evidence_refs
+    | eval llm_verdict=lower(trim(llm_verdict)), llm_confidence=tonumber(llm_confidence)
+| spath input=llm_json path=deviations{} output=llm_deviations
+| eval ai_attempts=coalesce(ai_attempts, 0)+1
+| eval verdict=case(
+    isnull(llm_verdict) AND ai_attempts<3, verdict,
+    isnull(llm_verdict) OR llm_confidence<0.6, "NEEDS_REVIEW",
+    llm_verdict="match", "COMPLIANT_WATCH",
+    llm_verdict="partial" OR llm_verdict="deviation", "IMPLEMENTATION_DEVIATION",
+    true(), "NEEDS_REVIEW")
+| eval status=case(verdict="PENDING_INTENT_CHECK", "intent_check", verdict="COMPLIANT_WATCH", "watch",
+        verdict="IMPLEMENTATION_DEVIATION", "alert", true(), "review"),
+    severity=if(verdict="IMPLEMENTATION_DEVIATION", "high", severity),
+    watch_until=if(status="watch", last_seen+259200, null()),
+    confidence=coalesce(llm_confidence, confidence), deviations=llm_deviations,
+    reasons=if(isnotnull(llm_reasons), mvappend(reasons, llm_reasons), reasons), evidence_refs=llm_evidence_refs,
+    ai_raw=substr(llm_raw, 1, 4000), ai_attempts=if(status="intent_check", ai_attempts, 0), updated_at=now()
+| fields - c_summary c_description c_plan llm_deviations
+| fields - aql_error arango_status arango_skipped nl cg_prompt llm_raw llm_json llm_verdict llm_confidence llm_reasons llm_evidence_refs
+| outputlookup cg_cases_lookup append=true key_field=_key
+| cgarango collection=cases key=case_id on_error=mark multivalue="targets,doi,related_changes,reasons,deviations,evidence_refs"
+    fields="case_id,session_device,platform,device_role,targets,doi,user,user_display,itam_user,is_automation,first_seen,last_seen,event_count,status,verdict,severity,chg_number,chg_source,match_via,chg_summary,related_changes,reasons,confidence,deviations,evidence_refs,watch_until,followup_case,rollback_case,impact_score,impact_incident,evidence_summary,alerted_at,updated_at"
+
+
+```
+  Saved search : CG - Investigate - Gather alternatives
+  Schedule     : */5 * * * *
+  Time range   : earliest=-1m latest=now
+                 max_concurrent = 1
+
+  Scenario 02, step 1 (no LLM): ask the graph for other explanations. Owns status=investigate.
+  Nothing found and not an automation account -> alert UNPLANNED_CHANGE straight away; otherwise -> explain.
+```
+| inputlookup cg_cases_lookup where status="investigate"
+| cgaql query=alt_explanations prefix="alt_" params="devices=doi"
+| where isnull(aql_error)
+| eval route=if(alt_total>0 OR is_automation=1, "explain", "alert")
+| eval verdict=if(route="alert", "UNPLANNED_CHANGE", verdict), status=route,
+    severity=if(route="alert", "high", severity), confidence=if(route="alert", 1, confidence),
+    reasons=if(route="alert", mvappend(reasons, "No other authorisation found: no CHG on HA peers or related CIs, none for ".itam_user." in the window, none raised afterwards, none referenced"), reasons),
+    updated_at=now()
+| fields - alt_own_related_count alt_peer_count alt_neighbour_count alt_person_count alt_late_count alt_ref_count alt_graph_ha_peers alt_count route
+| fields - aql_error arango_status arango_skipped nl cg_prompt llm_raw llm_json llm_verdict llm_confidence llm_reasons llm_evidence_refs
+| outputlookup cg_cases_lookup append=true key_field=_key
+| cgarango collection=cases key=case_id on_error=mark multivalue="targets,doi,related_changes,reasons,deviations,evidence_refs"
+    fields="case_id,session_device,platform,device_role,targets,doi,user,user_display,itam_user,is_automation,first_seen,last_seen,event_count,status,verdict,severity,chg_number,chg_source,match_via,chg_summary,related_changes,reasons,confidence,deviations,evidence_refs,watch_until,followup_case,rollback_case,impact_score,impact_incident,evidence_summary,alerted_at,updated_at"
+
+
+```
+  Saved search : CG - AI - Explain unplanned
+  Schedule     : */5 * * * *
+  Time range   : earliest=-1m latest=now
+                 max_concurrent = 1
+
+  Scenario 02, step 2: the LLM judges the graph's candidates. Owns status=explain. It may only name an
+  authorising change from the candidate list. JSON: verdict authorised_elsewhere|unplanned, authorising_change,
+  confidence, reasons[], evidence_refs[]. -> watch AUTHORISED_OTHER_CHG | alert UNPLANNED_CHANGE | review
+```
+| inputlookup cg_cases_lookup where status="explain"
+| eval nl=urldecode("%0A")
+| eval cg_prompt="You are ChangeGuard, a network change-assurance analyst. A configuration session had no change record covering it. Decide whether one of the CANDIDATE changes credibly authorised it.".nl.
+    "A candidate is credible only if its description covers what was changed on these devices, the timing fits and the engineer or group fits. Being nearby is not enough. Automation accounts still need an authorising change.".nl.
+    "Reply with ONLY one JSON object, no markdown: {\"verdict\":\"authorised_elsewhere|unplanned\",\"authorising_change\":\"<chg_number from the candidates or null>\",\"confidence\":0.0-1.0,\"reasons\":[\"...\"],\"evidence_refs\":[\"...\"]}".nl.nl.
+    "SESSION on ".session_device.if(mvcount(targets)>0, " pushed to ".mvjoin(targets, ", "), "")." by ".user." (".coalesce(user_display, "?").if(is_automation=1, ", AUTOMATION ACCOUNT", "").") ".strftime(first_seen, "%F %T")." to ".strftime(last_seen, "%F %T").nl.
+    "COMMIT COMMENTS: ".coalesce(comments, "none").nl.change_log.nl.nl.
+    "CANDIDATES (JSON; 'why' says how each was found):".nl.coalesce(alt_evidence, "[]")
+| ai prompt="{cg_prompt}"
+    | eval llm_raw=coalesce(ai_result_1, ai_result, response, result)
+| rex field=llm_raw "(?s)(?<llm_json>\{.*\})"
+    | spath input=llm_json path=verdict output=llm_verdict
+    | spath input=llm_json path=confidence output=llm_confidence
+    | spath input=llm_json path=reasons{} output=llm_reasons
+    | spath input=llm_json path=evidence_refs{} output=llm_evidence_refs
+    | eval llm_verdict=lower(trim(llm_verdict)), llm_confidence=tonumber(llm_confidence)
+| spath input=llm_json path=authorising_change output=alt_chg
+| eval ai_attempts=coalesce(ai_attempts, 0)+1,
+    alt_chg_valid=if(isnotnull(alt_chg) AND isnotnull(mvfind(alt_candidate_keys, "^".alt_chg."$")), 1, 0)
+| eval verdict=case(
+    isnull(llm_verdict) AND ai_attempts<3, verdict,
+    llm_verdict="authorised_elsewhere" AND alt_chg_valid=1 AND llm_confidence>=0.6, "AUTHORISED_OTHER_CHG",
+    llm_verdict="unplanned" AND llm_confidence>=0.6, "UNPLANNED_CHANGE",
+    true(), "NEEDS_REVIEW")
+| eval status=case(verdict="UNPLANNED_CANDIDATE", "explain", verdict="AUTHORISED_OTHER_CHG", "watch",
+        verdict="UNPLANNED_CHANGE", "alert", true(), "review"),
+    severity=case(verdict="UNPLANNED_CHANGE" AND is_automation=1, "medium", verdict="UNPLANNED_CHANGE", "high", true(), severity),
+    authorising_change=if(verdict="AUTHORISED_OTHER_CHG", alt_chg, null()),
+    chg_number=coalesce(authorising_change, chg_number), match_via=if(isnotnull(authorising_change), "ai_alternative", match_via),
+    watch_until=if(status="watch", last_seen+259200, null()),
+    confidence=coalesce(llm_confidence, confidence),
+    reasons=if(isnotnull(llm_reasons), mvappend(reasons, llm_reasons), reasons), evidence_refs=llm_evidence_refs,
+    ai_raw=substr(llm_raw, 1, 4000), ai_attempts=if(status="explain", ai_attempts, 0), updated_at=now()
+| fields - alt_chg alt_chg_valid
+| fields - aql_error arango_status arango_skipped nl cg_prompt llm_raw llm_json llm_verdict llm_confidence llm_reasons llm_evidence_refs
+| outputlookup cg_cases_lookup append=true key_field=_key
+| cgarango collection=cases key=case_id on_error=mark multivalue="targets,doi,related_changes,reasons,deviations,evidence_refs"
+    fields="case_id,session_device,platform,device_role,targets,doi,user,user_display,itam_user,is_automation,first_seen,last_seen,event_count,status,verdict,severity,chg_number,chg_source,match_via,chg_summary,related_changes,reasons,confidence,deviations,evidence_refs,watch_until,followup_case,rollback_case,impact_score,impact_incident,evidence_summary,alerted_at,updated_at"
+| eval candidate=alt_candidate_keys
+| mvexpand candidate
+| eval from=if(isnotnull(candidate), "cases/".case_id, null()), to="changes/".candidate,
+    reason=if(candidate=authorising_change, "accepted as authorising change", "considered as alternative authorisation")
+| cgarango collection=case_related from=from to=to fields="reason" on_error=mark
+
+
+```
+  Saved search : CG - Watch - Approved changes
+  Schedule     : */15 * * * *
+  Time range   : earliest=-1m latest=now
+                 max_concurrent = 1
+
+  Scenario 04 watcher. Owns status=watch. Signals: a ROLLBACK session on the same devices within 24h, a
+  FOLLOW-UP session (not under the same CHG) within 24h, and incidents on the devices' CIs or up to 2 hops
+  downstream (AQL). -> impact_check (score >= threshold) | closed COMPLIANT (72h over) | watch
+```
+| inputlookup cg_cases_lookup
+| where first_seen>=relative_time(now(), "-5d")
+| eval is_rollback=if(match(change_log, "(?i)\b(rollback|roll back|revert|load config|configure replace|undo)\b"), 1, 0), dev=doi
+| mvexpand dev
+| sort 0 dev -first_seen
+| streamstats current=f window=1 last(case_id) AS next_case last(first_seen) AS next_first last(is_rollback) AS next_rollback last(chg_number) AS next_chg BY dev
+| where status="watch"
+| eval fu=if(isnotnull(next_first) AND next_first-last_seen<=86400 AND (isnull(next_chg) OR isnull(chg_number) OR next_chg!=chg_number OR next_rollback=1), 1, 0),
+    fu_case=if(fu=1, next_case, null()), fu_min=if(fu=1, round((next_first-last_seen)/60), null()),
+    rb_case=if(fu=1 AND next_rollback=1, next_case, null())
+| eventstats values(fu_case) AS followup_case min(fu_min) AS followup_minutes values(rb_case) AS rollback_case BY case_id
+| dedup case_id
+| fields - dev next_case next_first next_rollback next_chg fu fu_case fu_min rb_case is_rollback
+| cgaql query=downstream_incidents prefix="w_" params="devices=doi,exclude=dismissed_incidents"
+| where isnull(aql_error)
+| eval impact_score=round(max(coalesce(w_top_score, 0), if(isnotnull(rollback_case), 0.6, 0), if(isnotnull(followup_case), 0.3, 0)), 2),
+    impact_incident=w_top_incident, impact_summary=w_top_summary, impact_priority=w_top_priority,
+    impact_hops=w_top_hops, impact_via=w_top_via, impact_delay_min=w_top_delay_min, impact_candidates=w_incident_keys
+| eval status=case(impact_score>=0.35, "impact_check", now()>watch_until, "closed", true(), "watch"),
+    verdict=if(status="closed" AND verdict="COMPLIANT_WATCH", "COMPLIANT", verdict), updated_at=now()
+| fields - w_*
+| fields - aql_error arango_status arango_skipped nl cg_prompt llm_raw llm_json llm_verdict llm_confidence llm_reasons llm_evidence_refs
+| outputlookup cg_cases_lookup append=true key_field=_key
+| cgarango collection=cases key=case_id on_error=mark multivalue="targets,doi,related_changes,reasons,deviations,evidence_refs"
+    fields="case_id,session_device,platform,device_role,targets,doi,user,user_display,itam_user,is_automation,first_seen,last_seen,event_count,status,verdict,severity,chg_number,chg_source,match_via,chg_summary,related_changes,reasons,confidence,deviations,evidence_refs,watch_until,followup_case,rollback_case,impact_score,impact_incident,evidence_summary,alerted_at,updated_at"
+
+
+```
+  Saved search : CG - AI - Impact check
+  Schedule     : */15 * * * *
+  Time range   : earliest=-1m latest=now
+                 max_concurrent = 1
+
+  Scenario 04: is the incident / rollback / follow-up plausibly caused by the change? Owns status=impact_check.
+  JSON: verdict plausible|not_plausible, confidence, reasons[], evidence_refs[].
+  -> alert POTENTIAL_FAILED_CHANGE | watch (the incidents are dismissed so they are not asked about again)
+```
+| inputlookup cg_cases_lookup where status="impact_check"
+| eval nl=urldecode("%0A")
+| eval cg_prompt="You are ChangeGuard, a network change-assurance analyst. An approved network change was followed by warning signs. Decide whether the change plausibly caused a failure.".nl.
+    "Consider: can the affected service be reached through these devices (hops), how soon after the change it started, whether the symptom fits what was changed, and whether a rollback or quick follow-up change suggests the change was being undone or fixed.".nl.
+    "Reply with ONLY one JSON object, no markdown: {\"verdict\":\"plausible|not_plausible\",\"confidence\":0.0-1.0,\"reasons\":[\"...\"],\"evidence_refs\":[\"...\"]}".nl.nl.
+    "CHANGE ".coalesce(chg_number, "?")." ".coalesce(chg_summary, "")." on ".session_device.if(mvcount(targets)>0, " pushed to ".mvjoin(targets, ", "), "")." by ".user.", finished ".strftime(last_seen, "%F %T").":".nl.change_log.nl.nl.
+    "INCIDENT: ".if(isnotnull(impact_incident), impact_incident." (P".impact_priority.") ".coalesce(impact_summary, "")." opened ".impact_delay_min." min after the change on ".coalesce(impact_via, "?").", ".impact_hops." hop(s) downstream", "none").nl.
+    "ROLLBACK SESSION: ".coalesce(mvjoin(rollback_case, ", "), "none").nl.
+    "FOLLOW-UP SESSION: ".coalesce(mvjoin(followup_case, ", ")." after ".followup_minutes." min", "none")
+| ai prompt="{cg_prompt}"
+    | eval llm_raw=coalesce(ai_result_1, ai_result, response, result)
+| rex field=llm_raw "(?s)(?<llm_json>\{.*\})"
+    | spath input=llm_json path=verdict output=llm_verdict
+    | spath input=llm_json path=confidence output=llm_confidence
+    | spath input=llm_json path=reasons{} output=llm_reasons
+    | spath input=llm_json path=evidence_refs{} output=llm_evidence_refs
+    | eval llm_verdict=lower(trim(llm_verdict)), llm_confidence=tonumber(llm_confidence)
+| eval ai_attempts=coalesce(ai_attempts, 0)+1,
+    failed=if(llm_verdict="plausible" AND llm_confidence>=0.6, 1, 0)
+| eval verdict=if(failed=1, "POTENTIAL_FAILED_CHANGE", verdict),
+    status=case(failed=1, "alert", isnull(llm_verdict) AND ai_attempts<3, "impact_check", true(), "watch"),
+    severity=if(failed=1, "high", severity),
+    dismissed_incidents=if(status="watch", mvdedup(mvappend(dismissed_incidents, impact_candidates)), dismissed_incidents),
+    confidence=if(failed=1, llm_confidence, confidence),
+    reasons=if(failed=1, mvappend(reasons, "Impact after the change: ".coalesce(impact_incident." (".impact_hops." hops, ".impact_delay_min." min)", "")." ".coalesce("rollback ".mvjoin(rollback_case, ","), "")." ".coalesce("follow-up ".mvjoin(followup_case, ","), ""), llm_reasons), reasons),
+    evidence_refs=if(failed=1, llm_evidence_refs, evidence_refs),
+    ai_raw=substr(llm_raw, 1, 4000), ai_attempts=if(status="impact_check", ai_attempts, 0), updated_at=now()
+| fields - aql_error arango_status arango_skipped nl cg_prompt llm_raw llm_json llm_verdict llm_confidence llm_reasons llm_evidence_refs
+| outputlookup cg_cases_lookup append=true key_field=_key
+| cgarango collection=cases key=case_id on_error=mark multivalue="targets,doi,related_changes,reasons,deviations,evidence_refs"
+    fields="case_id,session_device,platform,device_role,targets,doi,user,user_display,itam_user,is_automation,first_seen,last_seen,event_count,status,verdict,severity,chg_number,chg_source,match_via,chg_summary,related_changes,reasons,confidence,deviations,evidence_refs,watch_until,followup_case,rollback_case,impact_score,impact_incident,evidence_summary,alerted_at,updated_at"
+| eval from=if(failed=1 AND isnotnull(impact_incident), "cases/".case_id, null()), to="incidents/".impact_incident,
+    reason="incident after change (".impact_hops." hops, ".impact_delay_min." min)", score=impact_score
+| cgarango collection=case_related from=from to=to fields="reason,score" on_error=mark
+
+
+```
+  Saved search : CG - Alert - Raise alerts with evidence
+  Schedule     : */5 * * * *
+  Time range   : earliest=-1m latest=now
+                 max_concurrent = 1
+  Alert        : one alert per result (alert.digest_mode = 0); enable email/webhook in local/
+
+  Evidence package (case subgraph from ArangoDB + an AI write-up) and one alert per case.
+  Owns status=alert -> alerted. Enable email/webhook in local/savedsearches.conf.
+```
+| inputlookup cg_cases_lookup where status="alert"
+| cgaql query=case_evidence mode=json out=evidence_json
+| where isnull(aql_error)
+| eval nl=urldecode("%0A")
+| eval cg_prompt="You are ChangeGuard. Write a short evidence summary (max 8 lines, plain text) for the network operations team: what changed, why it was flagged, the key evidence and the recommended next step. Do not invent facts.".nl.nl.
+    "VERDICT: ".verdict." (severity ".severity.", confidence ".coalesce(confidence, "?").")".nl.
+    "SESSION: ".session_device." (".device_role.")".if(mvcount(targets)>0, " pushed to ".mvjoin(targets, ", "), "")." CIs ".coalesce(mvjoin(ci_names, ", "), "none").nl.
+    "BY: ".user." (".coalesce(user_display, "?").if(is_automation=1, ", automation", "").") ".strftime(first_seen, "%F %T")." to ".strftime(last_seen, "%F %T").nl.
+    "CHG: ".coalesce(chg_number, "none")." ".coalesce(chg_summary, "")." related: ".coalesce(mvjoin(related_changes, ", "), "none").nl.
+    "REASONS: ".coalesce(mvjoin(reasons, " | "), "").nl.
+    "DEVIATIONS: ".coalesce(mvjoin(deviations, " | "), "none").nl.
+    "CHANGES:".nl.substr(change_log, 1, 3000).nl.
+    "GRAPH EVIDENCE (JSON):".nl.substr(evidence_json, 1, 4000)
+| ai prompt="{cg_prompt}"
+    | eval llm_raw=coalesce(ai_result_1, ai_result, response, result)
+| eval evidence_summary=coalesce(llm_raw, verdict." on ".session_device." by ".user.": ".mvjoin(reasons, "; ")),
+    status="alerted", alerted_at=now(), updated_at=now()
+| fields - aql_error arango_status arango_skipped nl cg_prompt llm_raw llm_json llm_verdict llm_confidence llm_reasons llm_evidence_refs
+| outputlookup cg_cases_lookup append=true key_field=_key
+| cgarango collection=cases key=case_id on_error=mark multivalue="targets,doi,related_changes,reasons,deviations,evidence_refs"
+    fields="case_id,session_device,platform,device_role,targets,doi,user,user_display,itam_user,is_automation,first_seen,last_seen,event_count,status,verdict,severity,chg_number,chg_source,match_via,chg_summary,related_changes,reasons,confidence,deviations,evidence_refs,watch_until,followup_case,rollback_case,impact_score,impact_incident,evidence_summary,alerted_at,updated_at"
+| table case_id severity verdict platform session_device targets user user_display chg_number related_changes first_seen last_seen evidence_summary reasons deviations evidence_json
+
+
+```
+  Saved search : CG - Graph - Load CIs and devices
+  Schedule     : 23 */4 * * *
+  Time range   : earliest=-1m latest=now
+                 max_concurrent = 1
+
+  itam_ci_lookup -> Arango cis (+is_service), devices and device_is. Hostname normalisation is the lookup's
+  CI field, so the graph and the SPL matching agree. Runs after the itam_ci_lookup refresh.
+```
+| inputlookup itam_ci_lookup
+| where isnotnull(CI_Name) AND CI_Name!=""
+| eval CI=coalesce(CI, if(match(trim(CI_Name), "^\d{1,3}(\.\d{1,3}){3}$"), trim(CI_Name), lower(trim(mvindex(split(trim(CI_Name), "."), 0))))), is_service=if(match(lower(coalesce(Category, "")." ".coalesce(Type, "")), "service"), 1, 0), device_name=CI
+| cgarango collection=cis key=CI_Name fields="CI_Name,CI,Category,Type,Name,Site,Region,EnvironmentType,SystemRole,InstanceId,is_service" on_error=mark
+| cgarango collection=devices key=CI fields="device_name" on_error=mark
+| eval from="devices/".CI, to="cis/".CI_Name
+| cgarango collection=device_is from=from to=to fields="CI_Name" on_error=mark
+| stats count BY arango_status
+
+
+```
+  Saved search : CG - Graph - Load CI relationships
+  Schedule     : 33 */4 * * *
+  Time range   : earliest=-25h@h latest=now
+                 max_concurrent = 1
+
+  HELIX Asset_* parent/child -> ci_rel (provider -> consumer: impact flows from the child component to the
+  parent application/service). [ASSUMED] column names Parent Name / Child Name / Relationship Type.
+```
+index="itam-ci-database-app-s" source="*Asset*Relationship*"
+| eval parent_name=trim(coalesce('Parent Name', Parent_Name, ParentName, Parent)),
+    child_name=trim(coalesce('Child Name', Child_Name, ChildName, Child)),
+    rel_type=coalesce('Relationship Type', Relationship_Type, RelationshipType, "Dependency")
+| where isnotnull(parent_name) AND isnotnull(child_name) AND parent_name!=child_name
+| stats latest(rel_type) AS rel_type BY parent_name child_name
+| eval from="cis/".child_name, to="cis/".parent_name
+| cgarango collection=ci_rel from=from to=to fields="rel_type" on_error=mark
+| eval ci_end=mvappend(parent_name, child_name)
+| mvexpand ci_end
+| dedup ci_end
+| eval CI_Name=ci_end
+| cgarango collection=cis key=ci_end fields="CI_Name" on_error=mark
+| stats count BY arango_status
+
+
+```
+  Saved search : CG - Graph - Load changes
+  Schedule     : */15 * * * *
+  Time range   : earliest=-1m latest=now
+                 max_concurrent = 1
+
+  cg_changes KV -> Arango changes, people, implemented_by, chg_affects (to the device and, when known, the CI).
+  Incremental on updated_at. First/full load: run once with the where line removed.
+```
+| inputlookup cg_changes_lookup
+| where updated_at>=relative_time(now(), "-20m")
+| eval planned_start=start, planned_end=end, chg_key=change_id, person=implementer
+| cgarango collection=changes key=chg_key fields="change_id,source,status,approval,approved,risk,chg_type,planned_start,planned_end,created_at,implementer,imp_group,summary,description" on_error=mark
+| cgarango collection=people key=person fields="person" on_error=mark
+| eval from=if(len(implementer)>0, "changes/".change_id, null()), to="people/".implementer
+| cgarango collection=implemented_by from=from to=to fields="change_id" on_error=mark
+| eval aff=mvappend("devices/".device, if(len(ci_name)>0, "cis/".ci_name, null()))
+| mvexpand aff
+| eval from="changes/".change_id, to=aff
+| cgarango collection=chg_affects from=from to=to fields="change_id" on_error=mark
+| stats count BY arango_status
+
+
+```
+  Saved search : CG - Graph - Load incidents
+  Schedule     : */15 * * * *
+  Time range   : earliest=-20m@m latest=now
+                 max_concurrent = 1
+
+  HELIX Incident_Data -> incidents + inc_on (to the incident's CI and service CI).
+  [ASSUMED] Incident_Number, Description, Priority, Status, Reported_Date/Submit_Date, HPD_CI, ServiceCI.
+```
+index="itam-reporting-database-app-n" source="*Incident_Data*"
+| eval inc_number=coalesce(Incident_Number, Incident_ID), summary=coalesce(Description, Summary),
+    priority=case(match(lower(coalesce(Priority, "")), "critical|^1"), 1, match(lower(coalesce(Priority, "")), "high|^2"), 2,
+                  match(lower(coalesce(Priority, "")), "medium|^3"), 3, true(), 4),
+    inc_status=coalesce(Status, Incident_Status), opened_at=if(match(coalesce(Reported_Date, Submit_Date), "^\d+(\.\d+)?$"), tonumber(coalesce(Reported_Date, Submit_Date)), round(coalesce(strptime(coalesce(Reported_Date, Submit_Date), "%Y-%m-%d %H:%M:%S.%N"), strptime(coalesce(Reported_Date, Submit_Date), "%Y-%m-%d %H:%M:%S"), strptime(coalesce(Reported_Date, Submit_Date), "%m/%d/%Y %H:%M:%S")), 0)),
+    inc_ci=coalesce(HPD_CI, CI_Name, CI), service_ci=coalesce(ServiceCI, Service_CI, Service)
+| where isnotnull(inc_number)
+| stats latest(summary) AS summary latest(priority) AS priority latest(inc_status) AS inc_status
+    latest(opened_at) AS opened_at latest(inc_ci) AS inc_ci latest(service_ci) AS service_ci BY inc_number
+| cgarango collection=incidents key=inc_number fields="summary,priority,inc_status,opened_at,inc_ci,service_ci" on_error=mark
+| eval target=mvappend(inc_ci, service_ci)
+| mvexpand target
+| eval target_short=if(match(trim(target), "^\d{1,3}(\.\d{1,3}){3}$"), trim(target), lower(trim(mvindex(split(trim(target), "."), 0))))
+| lookup itam_ci_lookup CI_Name AS target OUTPUT CI_Name AS t_full
+| lookup itam_ci_lookup CI AS target_short OUTPUT CI_Name AS t_short
+| eval from=if(isnotnull(target), "incidents/".inc_number, null()), to="cis/".coalesce(t_full, mvindex(t_short, 0), target)
+| cgarango collection=inc_on from=from to=to fields="inc_number" on_error=mark
+| stats count BY arango_status
+
+
+```
+  Saved search : CG - Graph - Load devices, HA pairs and people
+  Schedule     : 41 * * * *
+  Time range   : earliest=-2h@h latest=now
+                 max_concurrent = 1
+
+  Devices seen in changeguard_detect (platform, role), HA pairs from the 01/02 naming rule (only when the peer
+  is a known CI) plus cg_ha_pairs.csv, and the people who made changes.
+```
+index=changeguard_detect
+| stats latest(platform) AS platform latest(device_role) AS role BY device
+| eval device_name=device, peer=case(match(device, "01$"), replace(device, "01$", "02"), match(device, "02$"), replace(device, "02$", "01"), true(), null())
+| cgarango collection=devices key=device fields="device_name,platform,role" on_error=mark
+| lookup itam_ci_lookup CI AS peer OUTPUT CI AS peer_ci
+| eval peer=if(isnotnull(peer_ci), peer, null()), a=if(device<peer, device, peer), b=if(device<peer, peer, device),
+    from=if(isnotnull(peer), "devices/".a, null()), to="devices/".b
+| cgarango collection=ha_peer from=from to=to fields="a,b" on_error=mark
+| append [| inputlookup cg_ha_pairs
+    | eval a=if(match(trim(device_a), "^\d{1,3}(\.\d{1,3}){3}$"), trim(device_a), lower(trim(mvindex(split(trim(device_a), "."), 0)))), b=if(match(trim(device_b), "^\d{1,3}(\.\d{1,3}){3}$"), trim(device_b), lower(trim(mvindex(split(trim(device_b), "."), 0)))), from="devices/".a, to="devices/".b
+    | cgarango collection=ha_peer from=from to=to fields="a,b" on_error=mark]
+| append [search index=changeguard_detect
+    | stats latest(user_display) AS display max(is_automation) AS is_automation BY user
+    | eval person=lower(replace(user, "@.*$", ""))
+    | cgarango collection=people key=person fields="person,display,is_automation" on_error=mark]
+| stats count BY arango_status
+
+
+```
+  Saved search : CG - Graph - Resync cases
+  Schedule     : 47 2 * * *
+  Time range   : earliest=-1m latest=now
+                 max_concurrent = 1
+
+  Nightly: re-mirror every KV case into the Arango cases vertex (covers writes skipped while Arango was down).
+```
+| inputlookup cg_cases_lookup
+| cgarango collection=cases key=case_id on_error=mark multivalue="targets,doi,related_changes,reasons,deviations,evidence_refs"
+    fields="case_id,session_device,platform,device_role,targets,doi,user,user_display,itam_user,is_automation,first_seen,last_seen,event_count,status,verdict,severity,chg_number,chg_source,match_via,chg_summary,related_changes,reasons,confidence,deviations,evidence_refs,watch_until,followup_case,rollback_case,impact_score,impact_incident,evidence_summary,alerted_at,updated_at"
+| stats count BY arango_status
+
+
+```
+  Saved search : CG - Validate - CI match rate by platform
+  Schedule     : manual / not scheduled
+  Time range   : earliest=-7d@d latest=now
+
+  Validation: share of devices / events that match itam_ci_lookup, per platform and role.
+```
+index=changeguard_detect
+| eval matched=if(isnotnull(ci_name), 1, 0)
+| stats dc(device) AS devices dc(eval(if(matched=1, device, null()))) AS devices_with_ci count AS events sum(matched) AS events_with_ci BY platform device_role
+| eval device_match_pct=round(100*devices_with_ci/devices, 1), event_match_pct=round(100*events_with_ci/events, 1)
+| sort platform device_role
+
+
+```
+  Saved search : CG - Validate - Unmatched devices
+  Schedule     : manual / not scheduled
+  Time range   : earliest=-7d@d latest=now
+
+  Validation: devices with no itam_ci_lookup match (fix the CI data or the hostname rule), and short names
+  that exist under more than one CI_Name.
+```
+index=changeguard_detect NOT ci_name=*
+| stats count AS events latest(_time) AS last_seen values(user) AS users BY platform device
+| eval issue="no CI", last_seen=strftime(last_seen, "%F %T")
+| append [| inputlookup itam_ci_lookup | stats dc(CI_Name) AS ci_names values(CI_Name) AS CI_Name BY CI | where ci_names>1 | rename CI AS device | eval issue="short name maps to ".ci_names." CIs"]
+| sort - events
+
+
+```
+  Saved search : CG - Validate - Change coverage by platform
+  Schedule     : manual / not scheduled
+  Time range   : earliest=-7d@d latest=now
+
+  Validation: share of change sessions with an authorising CHG, how it was found, and the feed it came from.
+```
+| inputlookup cg_cases_lookup
+| where first_seen>=relative_time(now(), "-7d@d")
+| eval has_chg=if(isnotnull(chg_number), 1, 0)
+| stats count AS sessions sum(has_chg) AS with_chg count(eval(is_ref=1)) AS by_comment_ref
+    count(eval(match_via="self")) AS via_self count(eval(match_via="target")) AS via_push_target
+    count(eval(match_via="ha_peer")) AS via_ha_peer count(eval(match_via="ai_alternative")) AS via_ai
+    count(eval(chg_source="HELIX")) AS from_helix count(eval(chg_source="CALM")) AS from_calm
+    count(eval(candidate_count>0)) AS with_related BY platform
+| eval coverage_pct=round(100*with_chg/sessions, 1)
+
+
+```
+  Saved search : CG - Validate - Verdict distribution by platform
+  Schedule     : manual / not scheduled
+  Time range   : earliest=-7d@d latest=now
+
+  Validation: verdicts per platform for the last 7 days.
+```
+| inputlookup cg_cases_lookup
+| where first_seen>=relative_time(now(), "-7d@d")
+| chart count OVER platform BY verdict
+
+
+```
+  Saved search : CG - Validate - Change feed health
+  Schedule     : manual / not scheduled
+  Time range   : earliest=-7d@d latest=now
+
+  Validation: cg_changes per source: rows, distinct changes, share with a resolved CI, time range, freshness.
+```
+| inputlookup cg_changes_lookup
+| eval ci_ok=if(len(ci_name)>0, 1, 0)
+| stats count AS rows dc(change_id) AS changes sum(ci_ok) AS rows_with_ci sum(approved) AS approved
+    min(start) AS earliest_start max(start) AS latest_start max(updated_at) AS last_update BY source
+| eval ci_pct=round(100*rows_with_ci/rows, 1), earliest_start=strftime(earliest_start, "%F"), latest_start=strftime(latest_start, "%F"),
+    last_update=strftime(last_update, "%F %T")
+
+
+```
+  Saved search : CG - Validate - Identity coverage
+  Schedule     : manual / not scheduled
+  Time range   : earliest=-7d@d latest=now
+
+  Validation: users seen in config changes with no global_address_lookup / roboID.csv match.
+```
+index=changeguard_detect
+| stats count AS events values(platform) AS platforms latest(user_display) AS user_display max(is_automation) AS is_automation BY user
+| where user_display=user AND is_automation=0
+| sort - events
+
+
+```
+  Saved search : CG - ML - Train change success model
+  Schedule     : 23 3 * * 0
+  Time range   : earliest=-1m latest=now
+                 max_concurrent = 1
+
+  Scenario 06 (stretch): train on closed/alerted cases with a CHG. Needs both outcomes in the data.
+```
+| inputlookup cg_cases_lookup where (status="closed" OR status="alerted")
+| where isnotnull(chg_number)
+| dedup chg_number
+| eval now=first_seen
+| cgaql query=change_features prefix="f_" params=""
+| where isnull(aql_error) AND f_count>0
+| eval failed=if(verdict="POTENTIAL_FAILED_CHANGE" OR verdict="IMPLEMENTATION_DEVIATION", 1, 0)
+| fit RandomForestClassifier failed from f_source f_risk f_ci_category f_device_count f_downstream_count f_changes_90d f_incidents_90d f_fail_rate_90d f_implementer_fail_rate f_duration_h f_start_hour f_start_weekday into cg_success_model
+
+
+```
+  Saved search : CG - ML - Score proposed changes
+  Schedule     : 41 6 * * *
+  Time range   : earliest=-1m latest=now
+                 max_concurrent = 1
+
+  Scenario 06: probability of success for upcoming CHGs (next 14 days), with an AI explanation.
+```
+| makeresults
+| eval now=now()
+| cgaql query=upcoming_changes mode=all
+| where isnotnull(chg_number)
+| cgaql query=change_features prefix="f_" params=""
+| apply cg_success_model probabilities=true
+| eval success_probability=round(100*'probability(failed=0)', 0)
+| eval cg_prompt="In two sentences, explain to a change manager why change ".chg_number." (".summary.") has an estimated ".success_probability."% chance of success. Features: downstream dependents ".f_downstream_count.", changes on the device in 90 days ".f_changes_90d.", incidents in 90 days ".f_incidents_90d.", failed-change rate ".f_fail_rate_90d.", engineer failure rate ".f_implementer_fail_rate.", risk ".f_risk.", duration ".f_duration_h."h, start hour ".f_start_hour." UTC."
+| ai prompt="{cg_prompt}"
+    | eval llm_raw=coalesce(ai_result_1, ai_result, response, result)
+| eval explanation=llm_raw
+| table chg_number summary planned_start implementer success_probability explanation f_*
+| outputlookup cg_change_risk.csv
+
+
+```
+  Saved search : CG - Demo - Seed changes
+  Schedule     : manual / not scheduled
+
+  Demo: cg_demo_changes.csv -> cg_changes (times relative to now). Run with CG - Demo - Seed detections.
+```
+| inputlookup cg_demo_changes
+| eval start=round(now())+start_offset_s, end=round(now())+end_offset_s,
+    created_at=if(len(created_offset_s)>0, round(now())+created_offset_s, null()),
+    implementer=if(len(implementer)>0, implementer, null()), updated_at=now(), _key=change_id."|".device
+| table _key change_id source device ci_name status approval approved risk chg_type start end created_at implementer imp_group summary description plan updated_at
+| outputlookup cg_changes_lookup append=true key_field=_key
+
+
+```
+  Saved search : CG - Demo - Seed detections
+  Schedule     : manual / not scheduled
+
+  Demo: cg_demo_detections.csv -> changeguard_detect through the same enrichment as the real detection search.
+```
+| inputlookup cg_demo_detections
+| foreach src cmd path comment result msg [eval <<FIELD>>=if(len('<<FIELD>>')>0, '<<FIELD>>', null())]
+| eval _time=round(now())-offset_s, event_id=md5(device."|".user."|".coalesce(cmd, "")."|".coalesce(path, msg, "")."|".offset_s)
+| eval device=if(match(trim(device), "^\d{1,3}(\.\d{1,3}){3}$"), trim(device), lower(trim(mvindex(split(trim(device), "."), 0)))), user=lower(trim(user))
+    | eval device_role=case(platform!="paloalto", platform, match(device, "^nspvmp"), "panorama", true(), "firewall"),
+        event_kind=case(platform="paloalto" AND cmd="commit-all", "push",
+                        platform="paloalto" AND match(cmd, "^commit"), "commit",
+                        platform="paloalto", "edit",
+                        platform="cisco_ios" AND cmd="cli", "edit", true(), "notice")
+    | lookup cg_panorama_members firewall AS device OUTPUT panorama AS member_of
+    | eval session_device=if(event_kind="push" AND device_role="firewall", coalesce(member_of, "nspvmp1822da01"), device),
+        detail=trim(if(platform="paloalto", coalesce(cmd, "")." ".coalesce(path, ""), coalesce(msg, cmd, "")).if(len(comment)>0, " [comment: ".comment."]", "")),
+        detail_kind=case(platform="paloalto" AND event_kind="edit" AND len(path)>0, "config_path",
+                         platform="cisco_ios" AND cmd="cli", "command", true(), "notice")
+    | rex field=detail max_match=5 "(?i)(?<chg_ref>\b(?:CRQ\d{6,12}|CHG\d{5,12}|CALM[-_]?\d{3,12})\b)"
+    | eval chg_refs=mvjoin(mvdedup(mvmap(chg_ref, upper(chg_ref))), " ")
+    | eval user_short=replace(user, "@.*$", "")
+    | lookup roboID.csv user AS user_short OUTPUTNEW description AS robo_description
+    | lookup global_address_lookup uid AS user_short OUTPUTNEW firstName surname title AS user_title
+    | eval is_automation=if(isnotnull(robo_description), 1, 0),
+        user_display=coalesce(robo_description, if(isnotnull(surname), surname.", ".firstName, null()), user)
+    | fields - firstName surname robo_description
+    | lookup itam_ci_lookup CI AS device OUTPUT CI_Name AS ci_name Name AS ci_product Category AS ci_category
+    | eval ci_name=mvindex(ci_name, 0), ci_product=mvindex(ci_product, 0), ci_category=mvindex(ci_category, 0)
+    | table _time event_id platform device device_role session_device event_kind user user_display user_title is_automation src cmd path comment result detail detail_kind chg_refs ci_name ci_product ci_category
+| collect index=changeguard_detect source="changeguard:demo"

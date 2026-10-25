@@ -1,0 +1,197 @@
+```
+  ChangeGuard AI - macros (default/macros.conf). Settings > Advanced search > Search macros.
+```
+
+``` macro: cg_src_pan ```
+index=network-services-pop-pan-net-s sourcetype="pan:config"
+
+``` macro: cg_src_ios ```
+index=network-services-pop-net-s ("%SYS-5-CONFIG_I" OR "%PARSER-5-CFGLOG_LOGGEDCMD")
+
+``` macro: cg_src_ftd ```
+index=secops-nspfirewalls-net ("mojo_server.pl" OR "sfdccsm" OR "ActionQueueScrape.pl")
+
+``` macro: cg_src_calm ```
+index="cmart-db-app-n" REQUEST_STATE="*RT*"
+
+``` macro: cg_itam_ci_extract ```
+index="itam-ci-database-app-s" sourcetype="itam-ci-extract"
+
+``` macro: cg_helix_change_info ```
+index="itam-reporting-database-app-n" source="*Change_Information*"
+
+``` macro: cg_helix_change_approvals ```
+index="itam-reporting-database-app-n" source="*Change_Approvals*"
+
+``` macro: cg_helix_change_ci ```
+index="itam-reporting-database-app-n" source="*Change_CI_Assoc*"
+
+``` macro: cg_helix_incidents ```
+index="itam-reporting-database-app-n" source="*Incident_Data*"
+
+``` macro: cg_helix_ci_rel ```
+index="itam-ci-database-app-s" source="*Asset*Relationship*"
+
+``` macro: cg_helix_table ```
+case(like(source, "%Change_Information%"), "info", like(source, "%Change_Approvals%"), "approval", like(source, "%Change_CI_Assoc%"), "ci", true(), "other")
+
+``` macro: cg_norm_host(1)   args: f ```
+if(match(trim($f$), "^\d{1,3}(\.\d{1,3}){3}$"), trim($f$), lower(trim(mvindex(split(trim($f$), "."), 0))))
+
+``` macro: cg_ha_peer(1)   args: d ```
+case(match($d$, "01$"), replace($d$, "01$", "02"), match($d$, "02$"), replace($d$, "02$", "01"), true(), null())
+
+``` macro: cg_is_panorama(1)   args: d ```
+match($d$, "^nspvmp")
+
+``` macro: cg_default_panorama ```
+"nspvmp1822da01"
+
+``` macro: cg_chg_ref_rex ```
+"(?i)(?<chg_ref>\b(?:CRQ\d{6,12}|CHG\d{5,12}|CALM[-_]?\d{3,12})\b)"
+
+``` macro: cg_rollback_regex ```
+"(?i)\b(rollback|roll back|revert|load config|configure replace|undo)\b"
+
+``` macro: cg_time(1)   args: f ```
+if(match($f$, "^\d+(\.\d+)?$"), tonumber($f$), round(coalesce(strptime($f$, "%Y-%m-%d %H:%M:%S.%N"), strptime($f$, "%Y-%m-%d %H:%M:%S"), strptime($f$, "%m/%d/%Y %H:%M:%S")), 0))
+
+``` macro: cg_enrich_user ```
+eval user_short=replace(user, "@.*$", "")
+    | lookup roboID.csv user AS user_short OUTPUTNEW description AS robo_description
+    | lookup global_address_lookup uid AS user_short OUTPUTNEW firstName surname title AS user_title
+    | eval is_automation=if(isnotnull(robo_description), 1, 0),
+        user_display=coalesce(robo_description, if(isnotnull(surname), surname.", ".firstName, null()), user)
+    | fields - firstName surname robo_description
+
+``` macro: cg_ci_match(1)   args: d ```
+lookup itam_ci_lookup CI AS $d$ OUTPUT CI_Name AS ci_name Name AS ci_product Category AS ci_category
+    | eval ci_name=mvindex(ci_name, 0), ci_product=mvindex(ci_product, 0), ci_category=mvindex(ci_category, 0)
+
+``` macro: cg_is_service_ci ```
+match(lower(coalesce(Category, "")." ".coalesce(Type, "")), "service")
+
+``` macro: cg_detect_enrich ```
+eval device=`cg_norm_host(device)`, user=lower(trim(user))
+    | eval device_role=case(platform!="paloalto", platform, `cg_is_panorama(device)`, "panorama", true(), "firewall"),
+        event_kind=case(platform="paloalto" AND cmd="commit-all", "push",
+                        platform="paloalto" AND match(cmd, "^commit"), "commit",
+                        platform="paloalto", "edit",
+                        platform="cisco_ios" AND cmd="cli", "edit", true(), "notice")
+    | lookup cg_panorama_members firewall AS device OUTPUT panorama AS member_of
+    | eval session_device=if(event_kind="push" AND device_role="firewall", coalesce(member_of, `cg_default_panorama`), device),
+        detail=trim(if(platform="paloalto", coalesce(cmd, "")." ".coalesce(path, ""), coalesce(msg, cmd, "")).if(len(comment)>0, " [comment: ".comment."]", "")),
+        detail_kind=case(platform="paloalto" AND event_kind="edit" AND len(path)>0, "config_path",
+                         platform="cisco_ios" AND cmd="cli", "command", true(), "notice")
+    | rex field=detail max_match=5 `cg_chg_ref_rex`
+    | eval chg_refs=mvjoin(mvdedup(mvmap(chg_ref, upper(chg_ref))), " ")
+    | `cg_enrich_user`
+    | `cg_ci_match(device)`
+    | table _time event_id platform device device_role session_device event_kind user user_display user_title is_automation src cmd path comment result detail detail_kind chg_refs ci_name ci_product ci_category
+
+``` macro: cg_window_slack ```
+1800
+
+``` macro: cg_related_before ```
+172800
+
+``` macro: cg_related_after ```
+86400
+
+``` macro: cg_w_ref ```
+8
+
+``` macro: cg_w_window ```
+4
+
+``` macro: cg_w_approved ```
+2
+
+``` macro: cg_w_user ```
+1
+
+``` macro: cg_calm_approved(1)   args: s ```
+match(upper(coalesce($s$, "")), "RT")
+
+``` macro: cg_helix_approved(2)   args: approval, status ```
+if(lower(coalesce($approval$, ""))="approved" OR (isnull($approval$) AND match(lower(coalesce($status$, "")), "scheduled|implementation in progress|completed")), 1, 0)
+
+``` macro: cg_summary_index ```
+changeguard_detect
+
+``` macro: cg_session_gap ```
+1800
+
+``` macro: cg_max_log_chars ```
+6000
+
+``` macro: cg_watch_seconds ```
+259200
+
+``` macro: cg_followup_seconds ```
+86400
+
+``` macro: cg_w_rollback ```
+0.6
+
+``` macro: cg_w_followup ```
+0.3
+
+``` macro: cg_impact_threshold ```
+0.35
+
+``` macro: cg_min_confidence ```
+0.6
+
+``` macro: cg_llm(2)   args: prompt_field, task ```
+`cg_llm_aitk($prompt_field$, $task$)`
+
+``` macro: cg_llm_aitk(2)   args: prompt_field, task ```
+ai prompt="{$prompt_field$}"
+    | eval llm_raw=coalesce(ai_result_1, ai_result, response, result)
+
+``` macro: cg_llm_mock(2)   args: prompt_field, task ```
+eval llm_raw=case(
+    "$task$"="intent", if(match(change_log, "(?i)any|temp"),
+        "{\"verdict\":\"deviation\",\"confidence\":0.9,\"deviations\":[\"Session changed objects the CHG does not mention (any/temp rule)\"],\"reasons\":[\"mock: out-of-scope object in config paths\"],\"evidence_refs\":[\"change_log\"]}",
+        "{\"verdict\":\"match\",\"confidence\":0.85,\"deviations\":[],\"reasons\":[\"mock: objects changed match the CHG\"],\"evidence_refs\":[\"change_log\"]}"),
+    "$task$"="alt", case(alt_total>0,
+        "{\"verdict\":\"authorised_elsewhere\",\"authorising_change\":\"".mvindex(alt_candidate_keys,0)."\",\"confidence\":0.8,\"reasons\":[\"mock: first candidate accepted\"],\"evidence_refs\":[\"".mvindex(alt_candidate_keys,0)."\"]}",
+        is_automation=1, "{\"verdict\":\"unplanned\",\"authorising_change\":null,\"confidence\":0.7,\"reasons\":[\"mock: automation account changed config without a CHG\"],\"evidence_refs\":[]}",
+        true(), "{\"verdict\":\"unplanned\",\"authorising_change\":null,\"confidence\":0.9,\"reasons\":[\"mock: no candidates\"],\"evidence_refs\":[]}"),
+    "$task$"="impact", "{\"verdict\":\"plausible\",\"confidence\":0.75,\"reasons\":[\"mock: impact signal shortly after the change\"],\"evidence_refs\":[\"".coalesce(impact_incident, rollback_case, followup_case, "")."\"]}",
+    "$task$"="narrative", "[mock] ".verdict." on ".session_device." by ".user.". ".mvjoin(reasons, " "),
+    true(), "[mock] no answer")
+
+``` macro: cg_parse_llm ```
+rex field=llm_raw "(?s)(?<llm_json>\{.*\})"
+    | spath input=llm_json path=verdict output=llm_verdict
+    | spath input=llm_json path=confidence output=llm_confidence
+    | spath input=llm_json path=reasons{} output=llm_reasons
+    | spath input=llm_json path=evidence_refs{} output=llm_evidence_refs
+    | eval llm_verdict=lower(trim(llm_verdict)), llm_confidence=tonumber(llm_confidence)
+
+``` macro: cg_nl ```
+eval nl=urldecode("%0A")
+
+``` macro: cg_case_fields ```
+fields - aql_error arango_status arango_skipped nl cg_prompt llm_raw llm_json llm_verdict llm_confidence llm_reasons llm_evidence_refs
+
+``` macro: cg_aw_docs(3)   args: collection, key, fields ```
+cgarango collection=$collection$ key=$key$ fields="$fields$" on_error=mark
+
+``` macro: cg_aw_edges(2)   args: collection, fields ```
+cgarango collection=$collection$ from=from to=to fields="$fields$" on_error=mark
+
+``` macro: cg_aq(3)   args: query, prefix, params ```
+cgaql query=$query$ prefix="$prefix$" params="$params$"
+
+``` macro: cg_aq_all(1)   args: query ```
+cgaql query=$query$ mode=all
+
+``` macro: cg_aq_json(2)   args: query, out ```
+cgaql query=$query$ mode=json out=$out$
+
+``` macro: cg_sync_case ```
+cgarango collection=cases key=case_id on_error=mark multivalue="targets,doi,related_changes,reasons,deviations,evidence_refs"
+    fields="case_id,session_device,platform,device_role,targets,doi,user,user_display,itam_user,is_automation,first_seen,last_seen,event_count,status,verdict,severity,chg_number,chg_source,match_via,chg_summary,related_changes,reasons,confidence,deviations,evidence_refs,watch_until,followup_case,rollback_case,impact_score,impact_incident,evidence_summary,alerted_at,updated_at"

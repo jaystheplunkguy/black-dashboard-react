@@ -95,6 +95,18 @@ Bugs found while testing this build, and fixed:
 - **Cleanup that deleted nothing.** `outputlookup … key_field=_key` only upserts, so the cleanup now replaces the collection instead.
 - **Dropped fields.** splunklib was dropping fields that only appear in later rows; the commands now give every row the same fields.
 
+## Plain SPL
+
+The scheduled searches are also exported as pasteable SPL (regenerate with `python3 tools/export_spl.py` after changing the conf):
+
+| File | Contents |
+|---|---|
+| `spl/changeguard_searches.spl` | All 28 searches as in the app (using the `cg_*` macros), each with its schedule and time range in an SPL comment |
+| `spl/changeguard_searches_expanded.spl` | The same searches with every macro expanded: they run without the app's macros, needing only the KV stores, lookups and Arango commands |
+| `spl/changeguard_macros.spl` | Every macro definition |
+
+All blocks pass Splunk's parser. The `ai`, `fit` and `apply` blocks need the AI Toolkit installed.
+
 ## Files
 
 ```
